@@ -144,6 +144,43 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
     if (width > 1) ITopTermPut(line, @"│", (NSInteger)(column + width - 1), font, color, nil);
 }
 
+// ---------------------------------------------------------------------------
+// Search-tag geometry and tap classification (htop F4-style in-place editing).
+// drawRect renders a right-aligned tag on the Tasks row: "search" when no
+// filter is active, "search:<text> ✕" when one is. Drawing, touch routing and
+// the --self-test checks share these pure helpers so the hit zones can never
+// drift apart between the renderer, the touch handler, and the tests.
+// ---------------------------------------------------------------------------
+
+typedef NS_ENUM(NSInteger, ITopSearchTap) {
+    ITopSearchTapNone = 0,
+    ITopSearchTapEdit,   // inside the tag, not on the trailing " ✕": open or edit the filter text
+    ITopSearchTapClear   // on the trailing " ✕" (last 2 cells): clear in place, no keyboard
+};
+
+static void ITopSearchTagGeometry(NSUInteger columns, NSString *filterText, NSUInteger titleLength,
+                                  NSInteger *outColumn, NSUInteger *outLength) {
+    *outColumn = NSNotFound;
+    *outLength = 0;
+    if (!filterText) filterText = @"";
+    NSUInteger tagLength = filterText.length ? 7 + filterText.length + 2 : 6;  // "search:" + n + " ✕", or "search"
+    if (columns < tagLength + 1) return;   // leave room for the trailing border cell
+    NSInteger column = (NSInteger)columns - (NSInteger)tagLength - 1;
+    if (column < 0 || column <= (NSInteger)titleLength + 5) return;  // must clear the "Tasks n/m" title
+    *outColumn = column;
+    *outLength = tagLength;
+}
+
+static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn, NSUInteger tagLength,
+                                         NSUInteger column) {
+    if (tagColumn < 0 || tagColumn == NSNotFound || tagLength == 0 ||
+        column < (NSUInteger)tagColumn || column >= (NSUInteger)tagColumn + tagLength)
+        return ITopSearchTapNone;
+    if (filterActive && tagLength >= 2 && column >= (NSUInteger)tagColumn + tagLength - 2)
+        return ITopSearchTapClear;
+    return ITopSearchTapEdit;
+}
+
 @interface ITopCanvas : UIView <UIKeyInput>
 @property (nonatomic, weak) id<ITopCanvasDelegate> delegate;
 @property (nonatomic, strong) ITopSnapshot *snapshot;
@@ -578,25 +615,24 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
     ITopTermPut(grid[_processStartRow], ITopTermBorder(columns, taskTitle, YES), 0, boldFont, theme.dim, nil);
     ITopTermPut(grid[_processStartRow], taskTitle, 3, boldFont, theme.cyan, nil);
     _searchTagCol = NSNotFound;
-    NSString *searchBody = self.filterText.length ?
-        [NSString stringWithFormat:@"search:%@", self.filterText] : @"search";
-    NSArray<NSArray<id> *> *searchParts;
-    if (self.filterText.length) {
-        searchParts = @[
-            @[@"search:", @"green"],
-            @[self.filterText, @"amber"],
-            @[@" ✕", @"red"]
-        ];
-    } else {
-        searchParts = @[ @[@"search", @"green"] ];
-    }
-    NSUInteger searchTagLength = 0;
-    for (NSArray<id> *part in searchParts) searchTagLength += [(NSString *)part[0] length];
-    NSInteger searchTagColumn = (NSInteger)columns - (NSInteger)searchTagLength - 1;
-    if (searchTagColumn > (NSInteger)taskTitle.length + 5) {
-        _searchTagCol = searchTagColumn;
-        _searchTagLen = searchTagLength;
-        NSUInteger partColumn = (NSUInteger)searchTagColumn;
+    _searchTagLen = 0;
+    NSInteger searchTagColumn;
+    NSUInteger searchTagLength;
+    ITopSearchTagGeometry(columns, self.filterText, taskTitle.length, &searchTagColumn, &searchTagLength);
+    _searchTagCol = searchTagColumn;
+    _searchTagLen = searchTagLength;
+    if (_searchTagCol != NSNotFound) {
+        NSArray<NSArray<id> *> *searchParts;
+        if (self.filterText.length) {
+            searchParts = @[
+                @[@"search:", @"green"],
+                @[self.filterText, @"amber"],
+                @[@" ✕", @"red"]
+            ];
+        } else {
+            searchParts = @[ @[@"search", @"green"] ];
+        }
+        NSUInteger partColumn = (NSUInteger)_searchTagCol;
         for (NSArray<id> *part in searchParts) {
             NSString *text = part[0];
             UIColor *color = [part[1] isEqualToString:@"amber"] ? theme.yellow :
@@ -783,13 +819,13 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         return;
     }
     if (row == _processStartRow && _searchTagCol != NSNotFound) {
-        if (column >= (NSUInteger)_searchTagCol && column < (NSUInteger)(_searchTagCol + _searchTagLen)) {
-            if (self.filterText.length && column >= (NSUInteger)(_searchTagCol + _searchTagLen - 2)) {
-                [self clearFilter];
-            } else {
-                [self.delegate itopChangeFilter];
-            }
-        }
+        // In-place filter editing: tapping the tag reopens the prompt seeded
+        // with the current text; the trailing " ✕" (last 2 cells) clears it
+        // in place without raising the keyboard.
+        ITopSearchTap action = ITopSearchTapAction(self.filterText.length > 0,
+                                                   _searchTagCol, _searchTagLen, column);
+        if (action == ITopSearchTapClear) [self clearFilter];
+        else if (action == ITopSearchTapEdit) [self.delegate itopChangeFilter];
         return;
     }
     if (row == _headingsRowActual) {

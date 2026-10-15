@@ -714,6 +714,16 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 }
 @end
 
+// Self-test expectation helper: prints nothing on success, one terse line on
+// failure, and returns 1 so callers can accumulate a failure count.
+static int ITopExpect(BOOL condition, const char *what) {
+    if (!condition) {
+        printf("  FAIL: %s\n", what);
+        return 1;
+    }
+    return 0;
+}
+
 static int ITopSelfTest(void) {
     @autoreleasepool {
         ITopMonitor *monitor = [ITopMonitor new];
@@ -762,6 +772,61 @@ static int ITopSelfTest(void) {
         } else {
             printf("PASS: Mach CPU/memory, proc_info enumeration, and diagnostic sampling are available\n");
         }
+
+        // ------------------------------------------------------------------
+        // TASK A self-check: in-place filter editing (htop F4-style).
+        // Verifies the shared search-tag geometry + tap classification at
+        // narrow (~70), wide (~130) and degenerate column counts, then the
+        // canvas-level edit round trip (tap-to-edit reopens with current text,
+        // Return accepts, cancel preserves, ✕/clearFilter clears).
+        // ------------------------------------------------------------------
+        int failures = 0;
+        printf("filter-tap self-check\n");
+        NSInteger tagColumn;
+        NSUInteger tagLength;
+        ITopSearchTagGeometry(100, @"spring", 15, &tagColumn, &tagLength);
+        // "search:" (7) + "spring" (6) + " ✕" (2) = 15 cells, right-aligned at columns-16.
+        failures += ITopExpect(tagColumn == 84 && tagLength == 15, "geometry: search:spring at 100 cols");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 84) == ITopSearchTapEdit &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 90) == ITopSearchTapEdit,
+                               "tap: interior cells route to edit");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 97) == ITopSearchTapClear &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 98) == ITopSearchTapClear,
+                               "tap: last 2 cells are the ✕ clear zone");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 83) == ITopSearchTapNone &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 99) == ITopSearchTapNone,
+                               "tap: cells outside the tag are inert");
+        failures += ITopExpect(ITopSearchTapAction(NO, 93, 6, 93) == ITopSearchTapEdit,
+                               "tap: idle search tag always edits (no ✕ exists)");
+        ITopSearchTagGeometry(70, @"spring", 15, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == 54 && tagLength == 15, "geometry: narrow ~70 col layout");
+        ITopSearchTagGeometry(130, @"spring", 15, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == 114 && tagLength == 15, "geometry: wide ~130 col layout");
+        ITopSearchTagGeometry(24, [@"x" stringByPaddingToLength:40 withString:@"x" startingAtIndex:0],
+                              5, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == NSNotFound, "geometry: oversized filter hides the tag (no wrap/negative)");
+        ITopSearchTagGeometry(70, @"", 64, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == NSNotFound, "geometry: tag hidden when it would collide with the title");
+        ITopCanvas *filterCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 1024, 768)];
+        [filterCanvas beginSearch];
+        failures += ITopExpect(filterCanvas.isSearching, "edit: keyboard prompt opens from empty");
+        [filterCanvas insertText:@"spring"];
+        [filterCanvas insertText:@"\n"];
+        failures += ITopExpect(!filterCanvas.isSearching && [filterCanvas.filterText isEqualToString:@"spring"],
+                               "edit: Return accepts the typed filter");
+        [filterCanvas beginSearch];          // tap to edit an existing filter (F4 flow)
+        failures += ITopExpect(filterCanvas.isSearching, "edit: reopen with an active filter");
+        [filterCanvas cancelSearch];
+        failures += ITopExpect(!filterCanvas.isSearching && [filterCanvas.filterText isEqualToString:@"spring"],
+                               "edit: Esc keeps the previously accepted filter");
+        [filterCanvas clearFilter];          // the ✕ tap path
+        failures += ITopExpect(!filterCanvas.isSearching && filterCanvas.filterText.length == 0,
+                               "clear: ✕ clears in place without keyboard");
+        if (failures) {
+            fprintf(stderr, "FAIL: filter-tap self-check: %d assertion(s) failed\n", failures);
+            return 1;
+        }
+        printf("  filter geometry + in-place edit flow: ok\n");
         return 0;
     }
 }

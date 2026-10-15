@@ -31,7 +31,10 @@ The bottom function-key bar is gone; its actions are integrated into the UI and 
 
 - Header row: `?` opens help, `R` re-samples now, and tapping the **FPS** readout holds or resumes sampling (it turns amber while held).
 - Column titles are sort buttons: tap to sort by that column, tap again to flip `▼/▲` direction. The active column shows the arrow in green.
-- Tasks bar: the right-aligned `search` tag opens the terminal filter prompt; while a filter is active it becomes `search:<text> ✕` where `✕` clears it.
+- Tasks bar: the right-aligned `search` tag opens the terminal filter prompt;
+  while a filter is active it becomes `search:<text> ✕` — tapping the tag reopens
+  the prompt pre-seeded with the current text for in-place editing (htop F4
+  style), and tapping `✕` clears the filter without raising the keyboard.
 - Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection.
 
 ## Display refresh note
