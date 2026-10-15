@@ -195,6 +195,19 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
         (uint64_t)UINT32_MAX - previous + current + 1;
 }
 
+// Per-process network audit (2026-10-15, on-device toolchain headers):
+//   1) struct rusage_info_v6 (sys/resource.h lines 368-413) carries CPU/QoS
+//      times, pageins, footprint, ri_diskio_*, energy, instruction/cycle and
+//      ri_reserved[14] counters only -- no network byte field in any v* variant.
+//   2) <net/ntstat.h> is absent and no nts_/ntstat symbol appears in
+//      /var/jb/usr/include or the SDK; no libnetstat in /var/jb/usr/lib, so
+//      the libnetstat ABI cannot be verified on-device.
+//   3) <sys/proc_info.h> and <libproc.h> are absent from both include trees,
+//      so PROC_PIDFDSOCKETINFO/struct socket_info field offsets cannot be
+//      verified; guessing them would risk fabricated numbers.
+// Conclusion: no honest per-process RX/TX source on this toolchain, so
+// ITopProcess deliberately has no netRx/netTx counters. The getifaddrs work
+// below is DEVICE-wide traffic, not per-process.
 - (void)sampleNetworkInto:(ITopSnapshot *)snapshot now:(NSTimeInterval)now {
     struct ifaddrs *interfaces = NULL;
     if (getifaddrs(&interfaces) != 0 || !interfaces) {
@@ -743,6 +756,18 @@ static int ITopSelfTest(void) {
                second.networkAvailable ? "interfaces" : "unavailable",
                (unsigned long long)second.appAvailableMemory,
                second.energyAvailable ? "counters" : "unavailable");
+        // Observational probe: which honest per-process network source, if any,
+        // is verifiable on-device. Never a test failure; see the audit note in
+        // -[ITopMonitor sampleNetworkInto:now:] and the README.
+        BOOL netNtstatHeader = access("/var/jb/usr/include/net/ntstat.h", F_OK) == 0 ||
+            access("/var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/include/net/ntstat.h", F_OK) == 0;
+        BOOL netProcInfoHeader = access("/var/jb/usr/include/sys/proc_info.h", F_OK) == 0 ||
+            access("/var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/include/sys/proc_info.h", F_OK) == 0;
+        printf("  net probe: rusage v6 %lu bytes and no network ri_ field, ntstat.h %s, proc_info.h %s\n",
+               (unsigned long)sizeof(struct rusage_info_v6),
+               netNtstatHeader ? "present" : "absent",
+               netProcInfoHeader ? "present" : "absent");
+        printf("  net probe: no-verifiable-source (device-wide getifaddrs only; see README)\n");
         printf("  process list: %lu PIDs, %lu readable; second sample %lu valid, peak %.1f%%\n",
                (unsigned long)second.processCount, (unsigned long)second.processes.count,
                (unsigned long)validProcesses, peakProcessCPU);
