@@ -34,6 +34,28 @@ The bottom function-key bar is gone; its actions are integrated into the UI and 
 - Tasks bar: the right-aligned `search` tag opens the terminal filter prompt; while a filter is active it becomes `search:<text> ✕` where `✕` clears it.
 - Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection.
 
+## Per-process network bytes: on-device audit
+
+The `Net` readout is device-wide RX/TX from `getifaddrs` (`en*`/`pdp_ip*`
+interfaces); it is not per-process. An on-device audit (2026-10-15) found no
+verifiable per-process byte accounting source, so itop does not display one:
+
+- `struct rusage_info_v6` (`sys/resource.h` lines 368–413 in the on-device
+  toolchain) exposes CPU/QoS times, wakeups, pageins, footprint, disk I/O,
+  energy, and instruction/cycle counters — no network field in any v4/v5/v6
+  variant.
+- `<net/ntstat.h>` is absent and no `nts_`/`ntstat` symbol appears in either
+  on-device include tree; no `libnetstat` ships in `/var/jb/usr/lib`, so the
+  libnetstat per-stream ABI cannot be verified.
+- `<sys/proc_info.h>` and `libproc.h` are absent from both include trees, so
+  the `PROC_PIDFDSOCKETINFO`/`struct socket_info` field offsets cannot be
+  verified. Inventing those layouts would risk fabricated numbers, which itop
+  will not ship.
+
+Revisit if a verifiable source appears on-device; the intended design is
+cumulative bytes-since-launch sampled lazily for the selected row only (at
+most every 5 s) and shown as `NET <rx>/<tx>` in the status line.
+
 ## Display refresh note
 
 itop requests the maximum refresh rate the current screen supports. The iPad 7,5 used for the device build has a 60 Hz display, so its physical maximum is 60 fps. ProMotion devices can run the display link up to 120 Hz. Metrics still sample at 1 Hz to keep overhead low; the cell grid redraws only when metrics or terminal state change.
