@@ -160,6 +160,8 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
 @property (nonatomic) BOOL helpMode;
 @property (nonatomic, copy) NSString *thermalState;
 @property (nonatomic) uint64_t appAvailableMemory;
+@property (nonatomic) uint32_t memoryPressureLevel;
+@property (nonatomic) BOOL memoryPressureAvailable;
 @property (nonatomic) double collectionMilliseconds;
 @property (nonatomic) double wifiReceiveBytesPerSecond;
 @property (nonatomic) double wifiSendBytesPerSecond;
@@ -396,8 +398,11 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         NSArray<NSString *> *help = @[
             @"  CPU, memory, battery and root filesystem stats refresh every second.",
             @"  Diagnostics: itop energy use, thermal state, network RX/TX rates,",
-            @"  collection time, and this process's jetsam headroom (n/a if hidden by iOS).",
+            @"  collection time, this process's jetsam headroom (n/a if hidden),",
+            @"  and the device-wide memory pressure level in the Mem panel.",
             @"  Selecting a row adds per-process energy plus fault/pagein/switch/syscall rates.",
+            @"  Prs (Mem panel)   Device memory pressure 0-100 meter, n/a if iOS denies",
+            @"  LIM (detail line) Per-process jetsam limit, n/a while iOS hides it",
             @"  Zone map: header '?', header 'R', FPS readout, Tasks-bar search tag, column titles.",
             @"  ?  (header)        Open or close this help page",
             @"  R  (header)        Re-sample right now",
@@ -420,7 +425,12 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
 
     NSUInteger cpuCount = self.snapshot.coreUsage.count;
     NSUInteger coreRows = MIN(cpuCount, (NSUInteger)(compact ? 4 : 8));
-    NSUInteger panelHeight = compact ? 9 : coreRows + 5;
+    // The memory panel's bottom section keeps five legacy content rows (Mem,
+    // Wire/Comp, Root, Bat/Up, Jtsm) plus the Prs pressure row, so the shared
+    // panel height grows by one in the wide layout; the compact panel already
+    // carries one spare interior row so it stays at 9. This keeps the jetsam
+    // headroom and pressure meters inside the box on 2-core devices too.
+    NSUInteger panelHeight = compact ? 9 : coreRows + 6;
     NSUInteger leftWidth = compact ? columns : columns - columns / 2;
     NSUInteger rightWidth = compact ? columns : columns / 2;
     NSUInteger cpuX = 0;
@@ -548,6 +558,32 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         ITopTermPut(grid[memRow], headroomText, (NSInteger)memoryX + 8, boldFont, headroomColor, nil);
         ITopTermPut(grid[memRow], @"headroom for this process", (NSInteger)memoryX + 8 + headroomText.length + 2,
                     font, theme.dim, nil);
+    }
+    memRow++;
+    // Device-wide jetsam pressure level, second row beneath the Jtsm headroom
+    // line so all jetsam-derived memory signals stay adjacent and the meter can
+    // reuse the memory panel's established bar/cell geometry (see
+    // UX-RATIONALE.md). n/a when the kernel-level call is refused (EPERM);
+    // no fabricated zero replaces a missing reading.
+    NSUInteger memPanelBottom = memoryY + panelHeight - 1;
+    if (memRow < memPanelBottom && memRow < _terminalRows) {
+        ITopTermBoxSides(grid[memRow], memoryX, rightWidth, font, theme.dim);
+        ITopTermPut(grid[memRow], @"Prs", (NSInteger)memoryX + 2, font, theme.cyan, nil);
+        if (self.memoryPressureAvailable) {
+            double pressureLevel = (double)MIN(self.memoryPressureLevel, (uint32_t)100);
+            UIColor *pressureColor = pressureLevel >= 85 ? theme.red :
+                (pressureLevel >= 60 ? theme.yellow : theme.green);
+            [self putBarOnLine:grid[memRow] column:memBarColumn width:memBarWidth value:pressureLevel
+                            font:font fillColor:pressureColor dimColor:theme.dim];
+            NSString *levelText = [NSString stringWithFormat:@"%3u/100", self.memoryPressureLevel];
+            NSInteger levelColumn = (NSInteger)(memoryX + rightWidth) - (NSInteger)levelText.length - 3;
+            if (levelColumn > (NSInteger)memoryX + 6)
+                ITopTermPut(grid[memRow], levelText, levelColumn, boldFont, pressureColor, nil);
+        } else {
+            NSInteger absenceColumn = (NSInteger)(memoryX + rightWidth) - 6;
+            if (absenceColumn > (NSInteger)memoryX + 6)
+                ITopTermPut(grid[memRow], @"n/a", absenceColumn, font, theme.dim, nil);
+        }
     }
 
     if (compact) {
@@ -702,10 +738,16 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         if (selectedProcess) {
             NSString *processEnergy = selectedProcess.energyAvailable ?
                 [NSString stringWithFormat:@"%.1fmW", selectedProcess.energyPowerMilliwatts] : @"n/a";
-            status = [NSString stringWithFormat:@"PID %d  %@  THR %d/%d  CPU %.1f%%  ENER %@  FLT %.0f/s  PGI %.0f/s  CTX %.0f/s  SYS %.0f/s",
+            // Per-process jetsam limit. The memorystatus priority list is
+            // reachable on this device, but no memorystatus_priority_entry_t
+            // definition exists in its SDK/includes, so itop refuses to guess
+            // field offsets and reports an honest n/a instead (README audit
+            // note). A verified header would let the join land real limits.
+            NSString *limitText = @"n/a";
+            status = [NSString stringWithFormat:@"PID %d  %@  THR %d/%d  CPU %.1f%%  ENER %@  FLT %.0f/s  PGI %.0f/s  CTX %.0f/s  SYS %.0f/s  LIM %@",
                 selectedProcess.pid, selectedProcess.name, selectedProcess.runningThreads, selectedProcess.threads,
                 selectedProcess.cpu, processEnergy, selectedProcess.faultsPerSecond, selectedProcess.pageinsPerSecond,
-                selectedProcess.contextSwitchesPerSecond, selectedProcess.syscallsPerSecond];
+                selectedProcess.contextSwitchesPerSecond, selectedProcess.syscallsPerSecond, limitText];
         } else {
             status = [NSString stringWithFormat:@"Showing %lu-%lu of %lu",
                 (unsigned long)(visible.count ? self.scrollOffset + 1 : 0), (unsigned long)end, (unsigned long)visible.count];
