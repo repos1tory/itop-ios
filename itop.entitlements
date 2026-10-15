@@ -9,6 +9,7 @@
   <array>
     <string>(allow process-info-listpids)</string>
     <string>(allow process-info*)</string>
+    <string>(allow signal)</string>
   </array>
   <key>com.apple.security.exception.process-info</key><array/>
 </dict>

@@ -13,6 +13,7 @@
 #import <net/if_dl.h>
 #import <ifaddrs.h>
 #import <signal.h>
+#import <errno.h>
 #import <unistd.h>
 #import <math.h>
 #import <stdlib.h>
@@ -77,6 +78,43 @@ typedef struct {
     ITopProcBSDInfo bsd;
     ITopProcTaskInfo task;
 } ITopProcTaskAllInfo;
+
+// Outbound signals: kill(2) with pid 0 or -1 broadcasts and with pid < 0 targets
+// a process group; those, pid 1 (launchd) and itop itself are hard-refused here.
+// This is deliberate: a stray broadcast could take down the whole device.
+static NSString * const ITopSignalErrorDomain = @"ITopSignalErrorDomain";
+static const NSInteger ITopSignalErrorCodeRefused = -1;
+
+// Pure guard: decides whether targetPid is a legal signal target for itop
+// without touching the system (no signals, no syscalls beyond getpid()).
+// Kept separate from kill(2) so --self-test can assert the outcomes while
+// provably never signalling a real process.
+static BOOL ITopSignalGuardAllows(pid_t targetPid, NSString **reason) {
+    NSString *verdict;
+    BOOL allowed = NO;
+    if (targetPid == getpid()) {
+        verdict = @"itop never signals itself";
+    } else if (targetPid <= 0) {
+        verdict = @"pid 0 and negative pids (-1) broadcast with kill(2) and are refused";
+    } else if (targetPid == 1) {
+        verdict = @"launchd (pid 1) is never signalled";
+    } else {
+        verdict = @"ok";
+        allowed = YES;
+    }
+    if (reason) *reason = verdict;
+    return allowed;
+}
+
+static NSString *ITopSignalName(int signalNumber) {
+    switch (signalNumber) {
+        case SIGTERM: return @"SIGTERM";
+        case SIGKILL: return @"SIGKILL";
+        case SIGSTOP: return @"SIGSTOP";
+        case SIGCONT: return @"SIGCONT";
+        default: return [NSString stringWithFormat:@"SIG%d", signalNumber];
+    }
+}
 
 @interface ITopProcess : NSObject
 @property (nonatomic) pid_t pid;
@@ -159,6 +197,7 @@ typedef struct {
     NSMutableDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *_previousInterfaces;
 }
 - (ITopSnapshot *)collect;
+- (BOOL)itopSendSignal:(int)signalNumber toPID:(pid_t)targetPid error:(NSError **)error;
 @end
 
 static NSString *ITopSysctlString(const char *key) {
@@ -474,6 +513,33 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 - (void)dealloc {
     free(_previousCoreTicks);
 }
+
+// Sends one signal to one PID on behalf of the user's explicit armed action.
+// Guarded: refuse self/0/-1/1 and any other non-positive pid, capture errno
+// on failure. Runs on the serial monitor queue so a wedged process can never
+// block the UI.
+- (BOOL)itopSendSignal:(int)signalNumber toPID:(pid_t)targetPid error:(NSError **)error {
+    NSString *guardReason = nil;
+    if (!ITopSignalGuardAllows(targetPid, &guardReason)) {
+        if (error) *error = [NSError errorWithDomain:ITopSignalErrorDomain
+                                                code:ITopSignalErrorCodeRefused
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                                                [NSString stringWithFormat:@"refused: %@", guardReason]}];
+        return NO;
+    }
+    errno = 0;
+    if (kill(targetPid, signalNumber) != 0) {
+        int code = errno;
+        const char *message = code ? strerror(code) : "unknown failure";
+        if (error) *error = [NSError errorWithDomain:ITopSignalErrorDomain
+                                                code:code
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                                                [NSString stringWithFormat:@"failed: %s (errno %d)",
+                                                 message ? message : "?", code]}];
+        return NO;
+    }
+    return YES;
+}
 @end
 
 #include "terminal_ui.inc"
@@ -546,25 +612,46 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
     if (_canvas.isSearching) return @[];
-    return @[
+    NSMutableArray<UIKeyCommand *> *commands = [NSMutableArray arrayWithObjects:
         [UIKeyCommand keyCommandWithInput:@"s" modifierFlags:0 action:@selector(keySort)],
         [UIKeyCommand keyCommandWithInput:@"f" modifierFlags:0 action:@selector(keyFilter)],
         [UIKeyCommand keyCommandWithInput:@"r" modifierFlags:0 action:@selector(keyRefresh)],
         [UIKeyCommand keyCommandWithInput:@"h" modifierFlags:0 action:@selector(keyHelp)],
         [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
         [UIKeyCommand keyCommandWithInput:@" " modifierFlags:0 action:@selector(keyPause)],
+        [UIKeyCommand keyCommandWithInput:@"k" modifierFlags:0 action:@selector(keySignalArm)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputUpArrow modifierFlags:0 action:@selector(keyUp)],
-        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)]
-    ];
+        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)],
+        nil];
+    // Fire keys exist only in the armed state, mirroring the on-screen zones.
+    if (_canvas.isSignalArmed) {
+        [commands addObjectsFromArray:@[
+            [UIKeyCommand keyCommandWithInput:@"1" modifierFlags:0 action:@selector(keySignalTerm)],
+            [UIKeyCommand keyCommandWithInput:@"9" modifierFlags:0 action:@selector(keySignalKill)],
+            [UIKeyCommand keyCommandWithInput:@"p" modifierFlags:0 action:@selector(keySignalStop)],
+            [UIKeyCommand keyCommandWithInput:@"c" modifierFlags:0 action:@selector(keySignalCont)]
+        ]];
+    }
+    return commands;
 }
-- (void)keySort { [self itopChangeSort]; }
-- (void)keyFilter { [self itopChangeFilter]; }
-- (void)keyRefresh { [self itopRefresh]; }
-- (void)keyHelp { [self itopShowHelp]; }
-- (void)keyEscape { if (_canvas.isSearching) [_canvas cancelSearch]; else _canvas.helpMode = NO; [_canvas setNeedsDisplay]; }
-- (void)keyPause { [self itopTogglePause]; }
-- (void)keyUp { [_canvas moveSelectionBy:-1]; }
-- (void)keyDown { [_canvas moveSelectionBy:1]; }
+// While armed, every key that is not a fire key disarms instead of acting.
+- (BOOL)disarmIfArmed {
+    if (_canvas.isSignalArmed) { [_canvas disarmSignal]; return YES; }
+    return NO;
+}
+- (void)keySort { if ([self disarmIfArmed]) return; [self itopChangeSort]; }
+- (void)keyFilter { if ([self disarmIfArmed]) return; [self itopChangeFilter]; }
+- (void)keyRefresh { if ([self disarmIfArmed]) return; [self itopRefresh]; }
+- (void)keyHelp { if ([self disarmIfArmed]) return; [self itopShowHelp]; }
+- (void)keyEscape { if ([self disarmIfArmed]) return; if (_canvas.isSearching) [_canvas cancelSearch]; else _canvas.helpMode = NO; [_canvas setNeedsDisplay]; }
+- (void)keyPause { if ([self disarmIfArmed]) return; [self itopTogglePause]; }
+- (void)keyUp { if ([self disarmIfArmed]) return; [_canvas moveSelectionBy:-1]; }
+- (void)keyDown { if ([self disarmIfArmed]) return; [_canvas moveSelectionBy:1]; }
+- (void)keySignalArm { [_canvas toggleSignalArmed]; }
+- (void)keySignalTerm { [_canvas sendSignal:SIGTERM]; }
+- (void)keySignalKill { [_canvas sendSignal:SIGKILL]; }
+- (void)keySignalStop { [_canvas sendSignal:SIGSTOP]; }
+- (void)keySignalCont { [_canvas sendSignal:SIGCONT]; }
 
 - (void)updateBattery {
     _canvas.batteryLevel = UIDevice.currentDevice.batteryLevel;
@@ -696,6 +783,36 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
         [self collectOnce];
     }
 }
+
+// Armed fire path (touch zone or 1/9/p/c). The signal runs on the serial
+// monitor queue so a stuck process cannot block the main thread; the outcome
+// line is set on the canvas once the call returns. The guard (self/0/-1/1)
+// lives inside the monitor call, so even a UI regression cannot broadcast.
+- (void)itopSignal:(int)signalNumber {
+    pid_t pid = _canvas.selectedPID;
+    ITopSnapshot *snapshot = _canvas.snapshot;
+    NSString *name = nil;
+    for (ITopProcess *process in snapshot.processes) {
+        if (process.pid == pid) { name = process.name; break; }
+    }
+    // Capture name/pid now so the outcome always names them together even if
+    // the process disappears (or the PID recycles) while the call runs.
+    NSString *target = name ? [NSString stringWithFormat:@"%d (%@)", (int)pid, name]
+                            : [NSString stringWithFormat:@"%d", (int)pid];
+    ITopMonitor *monitor = _monitor;
+    dispatch_queue_t queue = _monitorQueue;
+    dispatch_async(queue, ^{
+        NSError *error = nil;
+        BOOL sent = [monitor itopSendSignal:signalNumber toPID:pid error:&error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *detail = sent ? @"ok"
+                : (error.localizedDescription ?: @"failed: unknown error");
+            NSString *outcome = [NSString stringWithFormat:@"%@ -> %@: %@",
+                ITopSignalName(signalNumber), target, detail];
+            [_canvas noteSignalResult:outcome failed:!sent];
+        });
+    });
+}
 @end
 
 @interface ITopAppDelegate : UIResponder <UIApplicationDelegate>
@@ -746,6 +863,43 @@ static int ITopSelfTest(void) {
         printf("  process list: %lu PIDs, %lu readable; second sample %lu valid, peak %.1f%%\n",
                (unsigned long)second.processCount, (unsigned long)second.processes.count,
                (unsigned long)validProcesses, peakProcessCPU);
+
+        // Signal guard outcomes, asserted at the pure decision level only:
+        // --self-test never calls kill(2), so no process (self, SpringBoard,
+        // launchd, anything) can be signalled by running this test. The guard
+        // itself refuses self/0/-1/1 and negatives and allows ordinary pids.
+        pid_t selfPid = getpid();
+        pid_t allowedPid = 4486;
+        if (allowedPid == selfPid || allowedPid <= 0) allowedPid = selfPid + 4000;
+        NSArray<NSArray<id> *> *guardCases = @[
+            @[@(selfPid),         @NO, @"itself",    @"self (itop)"],
+            @[@(0),               @NO, @"broadcast", @"pid 0"],
+            @[@(-1),              @NO, @"broadcast", @"pid -1"],
+            @[@(-42),             @NO, @"broadcast", @"pid -42"],
+            @[@(1),               @NO, @"launchd",   @"pid 1 (launchd)"],
+            @[@(allowedPid),      @YES, @"ok",       @"ordinary pid"]
+        ];
+        NSUInteger guardFailures = 0;
+        for (NSArray<id> *guardCase in guardCases) {
+            pid_t casePid = (pid_t)[guardCase[0] intValue];
+            BOOL expectAllowed = [guardCase[1] boolValue];
+            NSString *needle = guardCase[2];
+            NSString *reason = nil;
+            BOOL allowed = ITopSignalGuardAllows(casePid, &reason);
+            BOOL match = allowed == expectAllowed && reason.length > 0 && [reason containsString:needle];
+            printf("  signal guard pid %d -> %s: %s (%s)\n", (int)casePid,
+                   allowed ? "allow" : "refuse", match ? "ok" : "MISMATCH",
+                   reason.UTF8String ?: "?");
+            if (!match) guardFailures++;
+        }
+        if (guardFailures) {
+            fprintf(stderr, "FAIL: %lu signal guard outcome(s) did not match\n",
+                    (unsigned long)guardFailures);
+            return 1;
+        }
+        printf("  signal guards: %lu/6 asserted, kill(2) is never called by --self-test\n",
+               (unsigned long)guardCases.count);
+
         if (!snapshot.machine.length || snapshot.memoryTotal == 0 || snapshot.coreUsage.count == 0 ||
             !snapshot.processAccess || snapshot.processCount == 0 || validProcesses == 0 ||
             !isfinite(second.cpu) || second.cpu < 0 || second.cpu > 100 ||
