@@ -11,6 +11,14 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
   collection time, and jetsam headroom for this process (shown as n/a when the
   runtime does not provide a value). Selecting a row adds per-process energy
   plus fault, page-in, context-switch, and syscall rates in the status line.
+- Device RX/TX sparklines: when the compact layout leaves a spare CPU-panel
+  interior row (≤ 3 exposed cores; 2 on the test device), a `RX ▂▅█▄▂▁▃  TX ▁▂▄▆▃▁▂` row
+  built from the same ▁▂▃▄▅▆▇█ sparkline charset as the CPU history draws
+  under it in green/cyan, log-scaled (`clamp(round(log10(rate+1) /
+  log10(100000) * 7), 0..7)`, so 100 KB/s fills the bar and each step is ~5.2x),
+  over a 64 one-second-sample ring pre-filled with zeros; zero rates render the
+  baseline bar instead of collapsing the row. The wide layout's panel is already
+  full (cores + 5 rows), so it silently skips the row instead of growing it.
 - Terminal key bar, touch row selection, swipe scrolling, and hardware keyboard shortcuts.
 - Process information entitlements are limited to enumeration/inspection; itop does not kill or modify processes.
 - iPhone and iPad layouts; deployment target iOS 15; arm64 package.

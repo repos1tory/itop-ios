@@ -746,6 +746,34 @@ static int ITopSelfTest(void) {
         printf("  process list: %lu PIDs, %lu readable; second sample %lu valid, peak %.1f%%\n",
                (unsigned long)second.processCount, (unsigned long)second.processes.count,
                (unsigned long)validProcesses, peakProcessCPU);
+
+        const double netRates[] = {0.0, 1.0, 10.0, 1000.0, 100000.0, 1e6, 1e9};
+        NSUInteger netPreviousLevel = 0, netLevelCount = 0;
+        for (NSUInteger i = 0; i < sizeof(netRates) / sizeof(netRates[0]); i++) {
+            NSUInteger level = ITopNetLevelForRate(netRates[i]);
+            netLevelCount++;
+            if (level < netPreviousLevel || level > 7) {
+                fprintf(stderr, "FAIL: net sparkline level %g B/s -> %lu is not monotonic/clamped in [0..7]\n",
+                        netRates[i], (unsigned long)level);
+                return 1;
+            }
+            netPreviousLevel = level;
+        }
+        NSMutableArray<NSNumber *> *rxProbe = [NSMutableArray array];
+        NSMutableArray<NSNumber *> *txProbe = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 64; i++) { [rxProbe addObject:@0]; [txProbe addObject:@0]; }
+        for (NSUInteger i = 0; i < 260; i++) {
+            ITopNetHistoryAppend(rxProbe, (double)i * 1000.0);
+            ITopNetHistoryAppend(txProbe, (double)(259 - i) * 500.0);
+        }
+        if (rxProbe.count != 64 || txProbe.count != 64 ||
+            rxProbe.lastObject.doubleValue != 259000.0 || txProbe.lastObject.doubleValue != 0.0) {
+            fprintf(stderr, "FAIL: net RX/TX history ring did not hold a 64-entry window\n");
+            return 1;
+        }
+        printf("  net sparklines: %lu rate levels (0->%lu, 1e6->%lu clamped); ring stays 64 entries after 520 appends\n",
+               (unsigned long)netLevelCount, (unsigned long)ITopNetLevelForRate(0.0),
+               (unsigned long)ITopNetLevelForRate(1e6));
         if (!snapshot.machine.length || snapshot.memoryTotal == 0 || snapshot.coreUsage.count == 0 ||
             !snapshot.processAccess || snapshot.processCount == 0 || validProcesses == 0 ||
             !isfinite(second.cpu) || second.cpu < 0 || second.cpu > 100 ||

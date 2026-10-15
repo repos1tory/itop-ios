@@ -144,6 +144,29 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
     if (width > 1) ITopTermPut(line, @"│", (NSInteger)(column + width - 1), font, color, nil);
 }
 
+// Log-scaled sparkline level for device network rates:
+// level = clamp(round(log10(rate + 1) / log10(100000) * 7), 0..7).
+// Each level step spans a rate factor of ~10^(5/7) ≈ 5.2x, so a few KB/s of
+// idle chatter stays visible above the zero baseline while 100 KB/s
+// (10^5 B/s) saturates the bar and anything faster clamps at the ceiling.
+// The +1 inside log10 keeps rate 0 pinned at level 0 and avoids log(0).
+static NSUInteger ITopNetLevelForRate(double rate) {
+    if (!isfinite(rate)) return rate > 0.0 ? 7 : 0;
+    if (rate <= 0.0) return 0;
+    double level = round(log10(rate + 1.0) / log10(100000.0) * 7.0);
+    if (level < 0.0) return 0;
+    if (level > 7.0) return 7;
+    return (NSUInteger)level;
+}
+
+// Ring window for the RX/TX sparklines, mirroring the _cpuHistory pattern:
+// one value appended per second, trimmed to 64, pre-filled with zeros at init.
+static void ITopNetHistoryAppend(NSMutableArray<NSNumber *> *history, double rate) {
+    if (!history) return;
+    [history addObject:@(MAX(0.0, rate))];
+    if (history.count > 64) [history removeObjectAtIndex:0];
+}
+
 @interface ITopCanvas : UIView <UIKeyInput>
 @property (nonatomic, weak) id<ITopCanvasDelegate> delegate;
 @property (nonatomic, strong) ITopSnapshot *snapshot;
@@ -178,6 +201,8 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
 @implementation ITopCanvas {
     NSArray<ITopProcess *> *_renderedRows;
     NSMutableArray<NSNumber *> *_cpuHistory;
+    NSMutableArray<NSNumber *> *_netRxHistory;
+    NSMutableArray<NSNumber *> *_netTxHistory;
     NSMutableString *_searchDraft;
     NSString *_searchOriginal;
     BOOL _searching;
@@ -218,6 +243,12 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         _searchTagCol = NSNotFound;
         _cpuHistory = [NSMutableArray arrayWithCapacity:64];
         for (NSUInteger i = 0; i < 64; i++) [_cpuHistory addObject:@0];
+        _netRxHistory = [NSMutableArray arrayWithCapacity:64];
+        _netTxHistory = [NSMutableArray arrayWithCapacity:64];
+        for (NSUInteger i = 0; i < 64; i++) {
+            [_netRxHistory addObject:@0];
+            [_netTxHistory addObject:@0];
+        }
         _batteryLevel = -1;
     }
     return self;
@@ -291,6 +322,10 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
     if (snapshot) {
         [_cpuHistory addObject:@(snapshot.cpu)];
         if (_cpuHistory.count > 64) [_cpuHistory removeObjectAtIndex:0];
+        // Device totals (Wi-Fi + cellular) sampled once per second alongside the
+        // CPU history; rates are zero while network sampling is unavailable.
+        ITopNetHistoryAppend(_netRxHistory, self.wifiReceiveBytesPerSecond + self.cellularReceiveBytesPerSecond);
+        ITopNetHistoryAppend(_netTxHistory, self.wifiSendBytesPerSecond + self.cellularSendBytesPerSecond);
     }
     [self setNeedsDisplay];
 }
@@ -490,6 +525,29 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
             [chart appendString:[levels substringWithRange:NSMakeRange(level, 1)]];
         }
         ITopTermPut(grid[graphRow], chart, 2, font, theme.green, nil);
+    }
+    NSUInteger netRow = graphRow + 1;
+    // Device RX/TX history row. The CPU panel interior spans rows 2 up to and
+    // including panelHeight-1; the row is drawn only when one interior row is
+    // still unclaimed after the CPU sparkline. The panel is never grown, so
+    // saturated layouts (wide: height is exactly cores+5) skip it silently.
+    if (netRow <= panelHeight - 1 && netRow < _terminalRows) {
+        NSUInteger netInterior = leftWidth > 2 ? leftWidth - 2 : 1;
+        NSUInteger graphColumns = netInterior > 12 ? MIN(16, (netInterior - 12) / 2) : 4;
+        NSString *levels = @"▁▂▃▄▅▆▇█";
+        NSMutableString *rxChart = [NSMutableString stringWithCapacity:graphColumns];
+        NSMutableString *txChart = [NSMutableString stringWithCapacity:graphColumns];
+        for (NSUInteger i = 0; i < graphColumns; i++) {
+            NSUInteger rxIndex = graphColumns > 1 ? i * (_netRxHistory.count - 1) / (graphColumns - 1) : _netRxHistory.count - 1;
+            NSUInteger txIndex = graphColumns > 1 ? i * (_netTxHistory.count - 1) / (graphColumns - 1) : _netTxHistory.count - 1;
+            [rxChart appendString:[levels substringWithRange:NSMakeRange(ITopNetLevelForRate(_netRxHistory[rxIndex].doubleValue), 1)]];
+            [txChart appendString:[levels substringWithRange:NSMakeRange(ITopNetLevelForRate(_netTxHistory[txIndex].doubleValue), 1)]];
+        }
+        NSUInteger txColumn = 7 + graphColumns;
+        ITopTermPut(grid[netRow], @"RX ", 2, font, theme.green, nil);
+        ITopTermPut(grid[netRow], rxChart, 5, font, theme.green, nil);
+        ITopTermPut(grid[netRow], @"TX ", (NSInteger)txColumn, font, theme.cyan, nil);
+        ITopTermPut(grid[netRow], txChart, (NSInteger)(txColumn + 3), font, theme.cyan, nil);
     }
 
     for (NSUInteger row = 2; row < 1 + panelHeight - 1 && row < _terminalRows; row++) {
