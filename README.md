@@ -19,9 +19,37 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
   over a 64 one-second-sample ring pre-filled with zeros; zero rates render the
   baseline bar instead of collapsing the row. The wide layout's panel is already
   full (cores + 5 rows), so it silently skips the row instead of growing it.
+- Per-process jetsam limits (LIM) and device pressure level (Prs) — n/a where
+  iOS denies access. Prs renders as a 0-100 meter in the Mem panel under the
+  jetsam-headroom row; LIM appears (honestly, never fabricated) at the end of
+  the selected-row detail line.
 - Terminal key bar, touch row selection, swipe scrolling, and hardware keyboard shortcuts.
 - Process information entitlements are limited to enumeration/inspection; itop does not kill or modify processes.
 - iPhone and iPad layouts; deployment target iOS 15; arm64 package.
+
+## memorystatus ABI audit (Prs / LIM)
+
+Device pressure is read with `SYS_memorystatus_get_level` (trap 453) and the
+priority list is probed, observationally, with `memorystatus_control`
+(trap 440). Evidence checked on the build device:
+
+- `/var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/include/sys/syscall.h:480`
+  defines `SYS_memorystatus_control 440`; line 493 defines
+  `SYS_memorystatus_get_level 453`.
+- `/var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/lib/libSystem.B.tbd:2653`
+  exports `_memorystatus_control`, and line 2654 exports
+  `_memorystatus_get_level`, so itop links the C wrapper rather than guessing
+  a symbol's existence.
+- No `sys/kern_memorystatus.h` (or any `memorystatus_priority_entry_t`
+  definition) exists under `/var/jb/usr/include` or the SDK includes — a
+  grep across `/var/jb` finds nothing but the two headers above.
+
+Because the priority-list **entry struct is unverifiable on this device**, itop
+calls the list command only in `--self-test` and prints the raw return/errno;
+it never parses entries into fake field meanings. Per-process limits therefore
+show `LIM n/a` until a toolchain ships the kernel header, and the pressure
+level (no struct involved) does ship. Unfilled expectations are always n/a,
+never zero — a missing reading must be distinguishable from a reading of 0.
 
 ## Build, test, install
 

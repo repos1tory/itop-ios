@@ -18,12 +18,44 @@
 #import <stdlib.h>
 #import <string.h>
 #import <time.h>
+#import <errno.h>
 
 // libproc is part of iOS libSystem, but Apple does not ship its header in the
 // public iOS SDK. Keep the tiny ABI surface we use here local and read-only.
 extern int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 extern int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
+
+// Jetsam memory-status trap numbers verified in the build device's own SDK:
+//   /var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/include/sys/syscall.h:480
+//       #define	SYS_memorystatus_control 440
+//   /var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/include/sys/syscall.h:493
+//       #define	SYS_memorystatus_get_level 453
+// (those are the only two memorystatus mentions in this SDK's headers, which
+//  is exactly why the per-priority entry struct is NOT parsed anywhere below).
+enum { ITopSysMemorystatusControl = 440, ITopSysMemorystatusGetLevel = 453 };
+
+// libc wrapper for trap 440. Verified exported from libSystem on this device:
+// /var/jb/usr/share/SDKs/iPhoneOS.sdk/usr/lib/libSystem.B.tbd:2653 lists
+// _memorystatus_control (next to _macx_triggers/_madvise) and :2654 lists
+// _memorystatus_get_level. Signature is the kernel trap's argument list; if a
+// foreign toolchain ever fails the link, syscall(ITopSysMemorystatusControl, ...)
+// is the fallback. Used only as an observational probe in ITopSelfTest.
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
+                                void *buffer, size_t buffer_size);
+
+// Device-wide jetsam pressure level (the same counter sysmon consumes).
+// No private struct is involved: the kernel writes one uint32 into the
+// caller's pointer. A sentinel proves the call actually wrote the value so a
+// silent failure can never be displayed as level 0 or any made-up number.
+static BOOL ITopMemoryPressureLevel(uint32_t *outLevel) {
+    if (!outLevel) return NO;
+    uint32_t level = 0xffffffffu;
+    int status = syscall(ITopSysMemorystatusGetLevel, &level);
+    if (status != 0 || level == 0xffffffffu) return NO;
+    *outLevel = level;
+    return YES;
+}
 
 enum { ITopProcAllPIDs = 1, ITopProcPIDTaskAllInfo = 2, ITopProcPIDTaskInfo = 4 };
 
@@ -127,6 +159,8 @@ typedef struct {
 @property (nonatomic) uint64_t memoryWired;
 @property (nonatomic) uint64_t memoryCompressed;
 @property (nonatomic) uint64_t appAvailableMemory;
+@property (nonatomic) uint32_t memoryPressureLevel;
+@property (nonatomic) BOOL memoryPressureAvailable;
 @property (nonatomic) uint64_t diskUsed;
 @property (nonatomic) uint64_t diskTotal;
 @property (nonatomic) double wifiReceiveBytesPerSecond;
@@ -443,6 +477,9 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
         default: snapshot.thermalState = @"UNKNOWN"; break;
     }
     snapshot.appAvailableMemory = os_proc_available_memory();
+    uint32_t jetsamLevel = 0;
+    snapshot.memoryPressureAvailable = ITopMemoryPressureLevel(&jetsamLevel);
+    snapshot.memoryPressureLevel = jetsamLevel; // 0 when the call is unavailable
     double overallCPU = 0;
     snapshot.coreUsage = [self sampleCoresWithOverall:&overallCPU];
     snapshot.cpu = overallCPU;
@@ -635,6 +672,8 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
             if (self->_canvas.isPaused || UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
             self->_canvas.thermalState = snapshot.thermalState;
             self->_canvas.appAvailableMemory = snapshot.appAvailableMemory;
+            self->_canvas.memoryPressureLevel = snapshot.memoryPressureLevel;
+            self->_canvas.memoryPressureAvailable = snapshot.memoryPressureAvailable;
             self->_canvas.collectionMilliseconds = snapshot.collectionMilliseconds;
             self->_canvas.wifiReceiveBytesPerSecond = snapshot.wifiReceiveBytesPerSecond;
             self->_canvas.wifiSendBytesPerSecond = snapshot.wifiSendBytesPerSecond;
@@ -768,6 +807,76 @@ static int ITopSelfTest(void) {
                netNtstatHeader ? "present" : "absent",
                netProcInfoHeader ? "present" : "absent");
         printf("  net probe: no-verifiable-source (device-wide getifaddrs only; see README)\n");
+
+        // Jetsam pressure probe: trap number verified in this SDK's syscall.h
+        // (see the comment block by ITopMemoryPressureLevel). EPERM or any other
+        // refusal prints n/a and still passes; only crashes can fail this.
+        uint32_t level = 0xffffffffu;
+        int levelStatus = syscall(ITopSysMemorystatusGetLevel, &level);
+        int levelErrno = errno; // captured before any other libc call
+        if (levelStatus == 0 && level != 0xffffffffu) {
+            printf("  pressure level: %u (ok)\n", level);
+        } else {
+            int failureCode = levelStatus < 0 ? levelErrno : levelStatus;
+            printf("  pressure level: n/a (errno %d: %s)\n", failureCode,
+                   failureCode ? strerror(failureCode) : "kernel wrote no value");
+        }
+        if (second.memoryPressureAvailable)
+            printf("  snapshot match: snapshot.memoryPressureLevel == %u (collect path agrees)\n",
+                   second.memoryPressureLevel);
+
+        // Priority-list probe (MEMORYSTATUS_CMD_GET_PRIORITY_LIST): the kernel
+        // copies entries into the caller's buffer and normally returns the byte
+        // count. itop prints the observation but never parses entries, because
+        // no memorystatus_priority_entry_t definition exists on this device (no
+        // sys/kern_memorystatus.h under /var/jb; README audit note). Anything
+        // short of a crash passes; a claimed copy larger than the buffer fails.
+        {
+            const size_t probeSize = 65536;
+            void *probe = calloc(1, probeSize);
+            if (!probe) {
+                fprintf(stderr, "FAIL: priority-list probe could not allocate %zu bytes\n", probeSize);
+                return 1;
+            }
+            int listStatus = memorystatus_control(1 /* MEMORYSTATUS_CMD_GET_PRIORITY_LIST */, 0, 0, probe, probeSize);
+            int listErrno = errno;
+            free(probe);
+            if (listStatus > (int)probeSize) {
+                fprintf(stderr, "FAIL: memorystatus_control claims %d copied bytes for a %zu-byte buffer\n",
+                        listStatus, probeSize);
+                return 1;
+            }
+            printf("  priority list probe: rc=%d errno=%d (observational; entry layout unverified on device, per-process LIM stays n/a)\n",
+                   listStatus, listErrno);
+        }
+
+        // Pure-LGU formatter test: 0 / positive / huge limit byte values must
+        // produce exact unit strings through ITopTermBytes, and the fixed-width
+        // clip path used for tabular text must never truncate a unit suffix.
+        {
+            NSArray<NSString *> *columns = @[
+                ITopTermBytes(0ull),                                  // zero
+                ITopTermBytes(15728640ull),                           // positive (15 MiB)
+                ITopTermBytes(5899345920ull),                         // huge but sane (5.5 GiB < 6 GB bound)
+                ITopTermBytes(1099511627776ull),                      // beyond device RAM, still no crash
+                ITopTermFixed(ITopTermBytes(5899345920ull), 10, NO)   // width-10 clip must keep the unit
+            ];
+            BOOL exact = [columns[0] isEqualToString:@"0B"] &&
+                         [columns[1] isEqualToString:@"15M"] &&
+                         [columns[2] isEqualToString:@"5.5G"] &&
+                         [columns[3] isEqualToString:@"1024.0G"] &&
+                         [columns[4] length] == 10 && [columns[4] hasPrefix:@"5.5G"];
+            if (exact) {
+                printf("  limit formatting: 0B / 15M / 5.5G / 1024.0G exact; fixed-width clip keeps the unit\n");
+            } else {
+                fprintf(stderr, "FAIL: limit formatting corrupted: %s / %s / %s / %s / %s\n",
+                        columns[0].UTF8String ?: "?", columns[1].UTF8String ?: "?",
+                        columns[2].UTF8String ?: "?", columns[3].UTF8String ?: "?",
+                        columns[4].UTF8String ?: "?");
+                return 1;
+            }
+        }
+
         printf("  process list: %lu PIDs, %lu readable; second sample %lu valid, peak %.1f%%\n",
                (unsigned long)second.processCount, (unsigned long)second.processes.count,
                (unsigned long)validProcesses, peakProcessCPU);
@@ -799,6 +908,18 @@ static int ITopSelfTest(void) {
         printf("  net sparklines: %lu rate levels (0->%lu, 1e6->%lu clamped); ring stays 64 entries after 520 appends\n",
                (unsigned long)netLevelCount, (unsigned long)ITopNetLevelForRate(0.0),
                (unsigned long)ITopNetLevelForRate(1e6));
+        // Exercise the 1 Hz collection loop a few extra times: the probe paths
+        // allocate nothing per cycle (level trap is register-argued, the
+        // priority probe frees its buffer), so repeated collects must neither
+        // accumulate state nor lose the reading.
+        NSUInteger pressureStable = 0;
+        for (NSUInteger check = 0; check < 3; check++) {
+            nanosleep(&pause, NULL);
+            ITopSnapshot *checkSnapshot = [monitor collect];
+            if (checkSnapshot.memoryPressureAvailable) pressureStable++;
+        }
+        printf("  probe stability: pressure level available in %lu/3 loop collects\n",
+               (unsigned long)pressureStable);
         if (!snapshot.machine.length || snapshot.memoryTotal == 0 || snapshot.coreUsage.count == 0 ||
             !snapshot.processAccess || snapshot.processCount == 0 || validProcesses == 0 ||
             !isfinite(second.cpu) || second.cpu < 0 || second.cpu > 100 ||
