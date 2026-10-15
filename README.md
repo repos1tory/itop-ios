@@ -35,7 +35,8 @@ The bottom function-key bar is gone; its actions are integrated into the UI and 
   while a filter is active it becomes `search:<text> ✕` — tapping the tag reopens
   the prompt pre-seeded with the current text for in-place editing (htop F4
   style), and tapping `✕` clears the filter without raising the keyboard.
-- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection.
+- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, J jump, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection, PgUp/PgDn to scroll one page, and Home/End to jump to the top or bottom of the list.
+- Pressing `J` opens a terminal jump prompt in the status-line region: type a PID and press Return to select it and scroll it into view, or Esc to cancel. Typing an unknown PID reports `no such pid` in the hint. Scrolling still works while the prompt is open.
 
 ## Display refresh note
 

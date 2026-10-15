@@ -546,25 +546,51 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
     if (_canvas.isSearching) return @[];
+    if (_canvas.isJumping) {
+        // Jump prompt is modal: Esc cancels, but paging still works so the
+        // user can review rows while choosing a PID; digits flow to insertText.
+        return @[
+            [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputPageUp modifierFlags:0 action:@selector(keyPageUp)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputPageDown modifierFlags:0 action:@selector(keyPageDown)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputHome modifierFlags:0 action:@selector(keyHome)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
+        ];
+    }
     return @[
         [UIKeyCommand keyCommandWithInput:@"s" modifierFlags:0 action:@selector(keySort)],
         [UIKeyCommand keyCommandWithInput:@"f" modifierFlags:0 action:@selector(keyFilter)],
+        [UIKeyCommand keyCommandWithInput:@"j" modifierFlags:0 action:@selector(keyJump)],
         [UIKeyCommand keyCommandWithInput:@"r" modifierFlags:0 action:@selector(keyRefresh)],
         [UIKeyCommand keyCommandWithInput:@"h" modifierFlags:0 action:@selector(keyHelp)],
         [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
         [UIKeyCommand keyCommandWithInput:@" " modifierFlags:0 action:@selector(keyPause)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputUpArrow modifierFlags:0 action:@selector(keyUp)],
-        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)]
+        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputPageUp modifierFlags:0 action:@selector(keyPageUp)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputPageDown modifierFlags:0 action:@selector(keyPageDown)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputHome modifierFlags:0 action:@selector(keyHome)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
     ];
 }
 - (void)keySort { [self itopChangeSort]; }
 - (void)keyFilter { [self itopChangeFilter]; }
+- (void)keyJump { [self itopBeginJump]; }
 - (void)keyRefresh { [self itopRefresh]; }
 - (void)keyHelp { [self itopShowHelp]; }
-- (void)keyEscape { if (_canvas.isSearching) [_canvas cancelSearch]; else _canvas.helpMode = NO; [_canvas setNeedsDisplay]; }
+- (void)keyEscape {
+    if (_canvas.isSearching) [_canvas cancelSearch];
+    else if (_canvas.isJumping) [_canvas cancelJump];
+    else _canvas.helpMode = NO;
+    [_canvas setNeedsDisplay];
+}
 - (void)keyPause { [self itopTogglePause]; }
 - (void)keyUp { [_canvas moveSelectionBy:-1]; }
 - (void)keyDown { [_canvas moveSelectionBy:1]; }
+- (void)keyPageUp { [_canvas scrollPageBy:-1]; }
+- (void)keyPageDown { [_canvas scrollPageBy:1]; }
+- (void)keyHome { [_canvas scrollToEdge:NO]; }
+- (void)keyEnd { [_canvas scrollToEdge:YES]; }
 
 - (void)updateBattery {
     _canvas.batteryLevel = UIDevice.currentDevice.batteryLevel;
@@ -660,6 +686,7 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 
 - (void)itopShowHelp {
     if (_canvas.isSearching) [_canvas cancelSearch];
+    if (_canvas.isJumping) [_canvas cancelJump];
     _canvas.helpMode = !_canvas.helpMode;
     [_canvas setNeedsDisplay];
 }
@@ -679,6 +706,11 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 - (void)itopChangeFilter {
     _canvas.helpMode = NO;
     [_canvas beginSearch];
+}
+
+- (void)itopBeginJump {
+    _canvas.helpMode = NO;
+    [_canvas beginJump];
 }
 
 - (void)itopTogglePause {
@@ -827,6 +859,59 @@ static int ITopSelfTest(void) {
             return 1;
         }
         printf("  filter geometry + in-place edit flow: ok\n");
+
+        // ------------------------------------------------------------------
+        // TASK B self-check: paging and jump-by-PID math on fabricated rows.
+        // ------------------------------------------------------------------
+        printf("paging & jump self-check\n");
+        NSMutableArray<ITopProcess *> *probe = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 50; i++) {
+            ITopProcess *process = [ITopProcess new];
+            process.pid = (pid_t)(1000 + i);
+            process.name = @"probe";
+            process.cpu = (double)i;
+            [probe addObject:process];
+        }
+        failures = 0;
+        // Page clamping: 50 rows in a 10-row viewport -> offset window [0,40].
+        failures += ITopExpect(ITopScrollMaximum(50, 10) == 40, "page: max offset for 50 rows/10 viewport");
+        failures += ITopExpect(ITopScrollClamp(100, 50, 10) == 40, "page: bottom overshoot clamps to 40");
+        failures += ITopExpect(ITopScrollClamp(0, 10, 10) == 0, "page: list shorter than viewport never scrolls");
+        failures += ITopExpect(ITopPagedOffset(20, 1, 50, 10) == 30, "page: PgDn advances one page");
+        failures += ITopExpect(ITopPagedOffset(20, -1, 50, 10) == 10, "page: PgUp backs up one page");
+        failures += ITopExpect(ITopPagedOffset(5, -1, 50, 10) == 0, "page: PgUp stops at top (no underflow)");
+        failures += ITopExpect(ITopPagedOffset(35, 1, 50, 10) == 40, "page: PgDn stops at bottom");
+        failures += ITopExpect(ITopPagedOffset(7, 1, 50, 0) == 7, "page: zero-capacity before first layout is inert");
+        failures += ITopExpect(ITopScrollMaximum(0, 0) == 0, "page: empty list stays at offset 0");
+        // Jump lookup over the fabricated visible rows (PIDs 1000..1049).
+        failures += ITopExpect(ITopRowIndexOfPID(probe, 1023) == 23, "jump: existing PID found at its index");
+        failures += ITopExpect(ITopRowIndexOfPID(probe, 7) == NSNotFound, "jump: absent PID reports not-found");
+        failures += ITopExpect(ITopJumpTargetPID(@"312") == 312, "jump: digits parse to a PID");
+        failures += ITopExpect(ITopJumpTargetPID(@"") == 0, "jump: empty draft commits to nothing");
+        failures += ITopExpect(ITopJumpTargetPID(@"-5") == 0, "jump: negative/invalid draft rejected");
+        failures += ITopExpect(ITopJumpTargetPID(@"99999999999999") == 0, "jump: overflow draft rejected");
+        // End-to-end prompt cycle: begin, type, commit to a real PID, then miss.
+        ITopCanvas *jumpCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 1024, 768)];
+        ITopSnapshot *probeSnapshot = [ITopSnapshot new];
+        probeSnapshot.processes = probe;
+        probeSnapshot.processCount = probe.count;
+        jumpCanvas.snapshot = probeSnapshot;
+        [jumpCanvas beginJump];
+        failures += ITopExpect(jumpCanvas.isJumping && !jumpCanvas.isSearching, "jump: J opens the prompt");
+        [jumpCanvas insertText:@"1023"];
+        [jumpCanvas insertText:@"\n"];
+        failures += ITopExpect(jumpCanvas.selectedPID == 1023 && !jumpCanvas.isJumping, "jump: Return selects and closes");
+        [jumpCanvas beginJump];
+        [jumpCanvas insertText:@"7"];
+        [jumpCanvas insertText:@"\n"];
+        failures += ITopExpect(jumpCanvas.isJumping && jumpCanvas.selectedPID == 1023, "jump: miss keeps prompt and selection");
+        [jumpCanvas cancelJump];
+        failures += ITopExpect(!jumpCanvas.isJumping && jumpCanvas.isSearching == NO, "jump: Esc closes the prompt");
+        if (failures) {
+            fprintf(stderr, "FAIL: paging & jump self-check: %d assertion(s) failed\n", failures);
+            return 1;
+        }
+        printf("  paging clamps and jump-to-PID: ok\n");
         return 0;
     }
 }

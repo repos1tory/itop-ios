@@ -3,6 +3,7 @@
 - (void)itopShowHelp;
 - (void)itopChangeSort;
 - (void)itopChangeFilter;
+- (void)itopBeginJump;
 - (void)itopTogglePause;
 - (void)itopRefresh;
 @end
@@ -181,6 +182,43 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     return ITopSearchTapEdit;
 }
 
+// ---------------------------------------------------------------------------
+// Scrolling and jump-by-PID math (PgUp/PgDn, Home/End, J).
+// Pure helpers shared by the canvas, so the --self-test can validate page
+// clamps and PID lookup against fabricated process rows.
+// ---------------------------------------------------------------------------
+
+static NSUInteger ITopScrollMaximum(NSUInteger rowCount, NSUInteger rowCapacity) {
+    return rowCount > rowCapacity ? rowCount - rowCapacity : 0;
+}
+
+static NSUInteger ITopScrollClamp(NSUInteger offset, NSUInteger rowCount, NSUInteger rowCapacity) {
+    return MIN(offset, ITopScrollMaximum(rowCount, rowCapacity));
+}
+
+// One PageUp/PageDown press moves by one visible page, clamped into range.
+static NSUInteger ITopPagedOffset(NSUInteger offset, NSInteger pages, NSUInteger rowCount,
+                                  NSUInteger rowCapacity) {
+    if (rowCapacity == 0 || pages == 0) return ITopScrollClamp(offset, rowCount, rowCapacity);
+    NSInteger next = (NSInteger)offset + (NSInteger)pages * (NSInteger)rowCapacity;
+    return ITopScrollClamp((NSUInteger)MAX(0, next), rowCount, rowCapacity);
+}
+
+static NSUInteger ITopRowIndexOfPID(NSArray<ITopProcess *> *rows, pid_t pid) {
+    for (NSUInteger index = 0; index < rows.count; index++) {
+        if (rows[index].pid == pid) return index;
+    }
+    return NSNotFound;
+}
+
+// PID typed into the jump prompt; 0 means "nothing valid typed yet".
+static pid_t ITopJumpTargetPID(NSString *draft) {
+    if (!draft.length) return 0;
+    NSInteger value = [draft integerValue];
+    if (value <= 0 || value > INT32_MAX) return 0;
+    return (pid_t)value;
+}
+
 @interface ITopCanvas : UIView <UIKeyInput>
 @property (nonatomic, weak) id<ITopCanvasDelegate> delegate;
 @property (nonatomic, strong) ITopSnapshot *snapshot;
@@ -206,10 +244,15 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 @property (nonatomic) BOOL energyAvailable;
 @property (nonatomic) double ownerEnergyPowerMilliwatts;
 - (void)moveSelectionBy:(NSInteger)delta;
+- (void)scrollPageBy:(NSInteger)pages;
+- (void)scrollToEdge:(BOOL)bottom;
 - (void)beginSearch;
 - (void)cancelSearch;
 - (void)clearFilter;
+- (void)beginJump;
+- (void)cancelJump;
 - (BOOL)isSearching;
+- (BOOL)isJumping;
 @end
 
 @implementation ITopCanvas {
@@ -218,6 +261,9 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     NSMutableString *_searchDraft;
     NSString *_searchOriginal;
     BOOL _searching;
+    NSMutableString *_jumpDraft;
+    BOOL _jumping;
+    BOOL _jumpMiss;
     CGFloat _cellWidth;
     CGFloat _lineHeight;
     CGFloat _originY;
@@ -253,6 +299,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
         _refreshCol = NSNotFound;
         _fpsCol = NSNotFound;
         _searchTagCol = NSNotFound;
+        _jumpDraft = [NSMutableString string];
         _cpuHistory = [NSMutableArray arrayWithCapacity:64];
         for (NSUInteger i = 0; i < 64; i++) [_cpuHistory addObject:@0];
         _batteryLevel = -1;
@@ -261,8 +308,9 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 }
 
 - (BOOL)isSearching { return _searching; }
+- (BOOL)isJumping { return _jumping; }
 - (BOOL)canBecomeFirstResponder { return YES; }
-- (BOOL)hasText { return _searchDraft.length > 0; }
+- (BOOL)hasText { return _searching ? _searchDraft.length > 0 : (_jumping ? _jumpDraft.length > 0 : NO); }
 - (UIKeyboardType)keyboardType { return UIKeyboardTypeASCIICapable; }
 - (UITextAutocapitalizationType)autocapitalizationType { return UITextAutocapitalizationTypeNone; }
 - (UITextAutocorrectionType)autocorrectionType { return UITextAutocorrectionTypeNo; }
@@ -270,7 +318,22 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 - (UIKeyboardAppearance)keyboardAppearance { return UIKeyboardAppearanceDark; }
 
 - (void)insertText:(NSString *)text {
-    if (!_searching || !text.length) return;
+    if ((!_searching && !_jumping) || !text.length) return;
+    if (_jumping) {
+        // Jump prompt is numeric: digits collect, Return commits, Esc cancels;
+        // punctuation, arrows and other keys are silently ignored.
+        if ([text containsString:@"\n"] || [text containsString:@"\r"]) { [self commitJump]; return; }
+        if ([text containsString:ITopEscapeKey()]) { [self cancelJump]; return; }
+        for (NSUInteger i = 0; i < text.length; i++) {
+            unichar character = [text characterAtIndex:i];
+            if (character >= '0' && character <= '9' && _jumpDraft.length < 7) {
+                [_jumpDraft appendFormat:@"%C", character];
+                _jumpMiss = NO;
+            }
+        }
+        [self setNeedsDisplay];
+        return;
+    }
     if ([text containsString:@"\n"] || [text containsString:@"\r"]) {
         _searching = NO;
         [self resignFirstResponder];
@@ -288,6 +351,14 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 }
 
 - (void)deleteBackward {
+    if (_jumping) {
+        if (!_jumpDraft.length) return;
+        NSRange last = [_jumpDraft rangeOfComposedCharacterSequenceAtIndex:_jumpDraft.length - 1];
+        [_jumpDraft deleteCharactersInRange:last];
+        _jumpMiss = NO;
+        [self setNeedsDisplay];
+        return;
+    }
     if (!_searching || !_searchDraft.length) return;
     NSRange last = [_searchDraft rangeOfComposedCharacterSequenceAtIndex:_searchDraft.length - 1];
     [_searchDraft deleteCharactersInRange:last];
@@ -300,9 +371,56 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     _searchOriginal = [self.filterText copy] ?: @"";
     _searchDraft = [self.filterText mutableCopy] ?: [NSMutableString string];
     _searching = YES;
+    [self pruneJumpState];   // the two prompts are exclusive; drop any jump draft
     self.helpMode = NO;
     [self becomeFirstResponder];
     [self setNeedsDisplay];
+}
+
+// Jump prompt: after pressing J, typed digits form a PID; Return selects that
+// process in the visible list and scrolls it into view, Esc cancels. Uses the
+// same prompt region and styling as the search filter.
+- (void)beginJump {
+    if (_searching) return;
+    _searching = NO;
+    [self pruneJumpState];
+    _jumping = YES;
+    self.helpMode = NO;
+    [self becomeFirstResponder];
+    [self setNeedsDisplay];
+}
+
+- (void)cancelJump {
+    if (!_jumping) return;
+    [self closeJump];
+}
+
+- (void)commitJump {
+    if (!_jumping) return;
+    pid_t target = ITopJumpTargetPID(_jumpDraft);
+    NSArray<ITopProcess *> *rows = _renderedRows.count ? _renderedRows : [self visibleProcesses];
+    NSUInteger index = ITopRowIndexOfPID(rows, target);
+    if (target && index != NSNotFound) {
+        self.selectedPID = rows[index].pid;
+        [self revealRowIndex:index];
+        [self closeJump];
+    } else {
+        _jumpMiss = YES;   // stays in jump mode; the hint shows the miss until the next key
+        [self setNeedsDisplay];
+    }
+}
+
+- (void)closeJump {
+    [self pruneJumpState];
+    [self resignFirstResponder];
+    [self setNeedsDisplay];
+}
+
+// Drops all transient jump-prompt state (used when either prompt closes).
+- (void)pruneJumpState {
+    _jumping = NO;
+    _jumpMiss = NO;
+    _jumpDraft = [NSMutableString string];
 }
 
 - (void)cancelSearch {
@@ -310,6 +428,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     _searching = NO;
     self.filterText = _searchOriginal ?: @"";
     self.scrollOffset = 0;
+    [self pruneJumpState];
     [self resignFirstResponder];
     [self setNeedsDisplay];
 }
@@ -319,6 +438,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     self.filterText = @"";
     _searchDraft = [NSMutableString string];
     self.scrollOffset = 0;
+    [self pruneJumpState];
     [self resignFirstResponder];
     [self setNeedsDisplay];
 }
@@ -440,9 +560,11 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
             @"  R  (header)        Re-sample right now",
             @"  FPS readout        Tap to hold/resume sampling; turns amber while held",
             @"  Column titles      Tap to sort; tap again to flip ▼/▲ direction",
-            @"  search (Tasks bar) Open the terminal filter prompt; ✕ clears the filter",
+            @"  search (Tasks bar) Tap to open/edit the filter prompt; ✕ clears it in place",
             @"  ↑ / ↓ or swipe     Select and scroll processes",
-            @"  Keyboard: S sort-cycle, F search, Space pause, R refresh, F1 help, Esc cancel",
+            @"  PgUp/PgDn          Scroll one page; Home/End jump to top/bottom",
+            @"  J then digits      Jump: type a PID, Return selects, Esc cancels",
+            @"  Keyboard: S sort-cycle, F search, J jump, Space pause, R refresh, F1 help, Esc cancel",
             @"  Tap a process row to select it. No process is signalled or modified by itop."
         ];
         NSUInteger helpRow = 4;
@@ -646,7 +768,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
     _processDataStartRow = _processStartRow + 3;
     NSUInteger statusRow = _footerRow;
     _rowCapacity = statusRow > _processDataStartRow ? statusRow - _processDataStartRow : 0;
-    NSUInteger maximumOffset = visible.count > _rowCapacity ? visible.count - _rowCapacity : 0;
+    NSUInteger maximumOffset = ITopScrollMaximum(visible.count, _rowCapacity);
     self.scrollOffset = MIN(self.scrollOffset, maximumOffset);
 
     BOOL narrow = columns < 82;
@@ -729,13 +851,16 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 
     NSString *status;
     if (_searching) status = [NSString stringWithFormat:@"Search: %@_   Return: accept   Esc: cancel", _searchDraft ?: @""];
+    else if (_jumping) status = _jumpMiss ?
+        [NSString stringWithFormat:@"jump: %@?  no such pid  Return jump  Esc cancel", _jumpDraft ?: @""] :
+        [NSString stringWithFormat:@"jump: %@?  Return jump  Esc cancel", _jumpDraft.length ? _jumpDraft : @"pid"];
     else if (!self.snapshot.processAccess) status = @"ERROR: process-info access denied; check jailbreak signing entitlements";
     else if (visible.count == 0 && self.snapshot.processCount > 0) status = @"No readable processes; check PROC_PIDTASKALLINFO entitlement/ABI";
     else if (visible.count == 0) status = @"No matching processes";
     else if (self.selectedPID) {
-        ITopProcess *selectedProcess = nil;
-        for (ITopProcess *process in visible) if (process.pid == self.selectedPID) { selectedProcess = process; break; }
-        if (selectedProcess) {
+        NSUInteger selectedIndex = ITopRowIndexOfPID(visible, self.selectedPID);
+        if (selectedIndex != NSNotFound) {
+            ITopProcess *selectedProcess = visible[selectedIndex];
             NSString *processEnergy = selectedProcess.energyAvailable ?
                 [NSString stringWithFormat:@"%.1fmW", selectedProcess.energyPowerMilliwatts] : @"n/a";
             status = [NSString stringWithFormat:@"PID %d  %@  THR %d/%d  CPU %.1f%%  ENER %@  FLT %.0f/s  PGI %.0f/s  CTX %.0f/s  SYS %.0f/s",
@@ -748,7 +873,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
         }
     } else status = [NSString stringWithFormat:@"Showing %lu-%lu of %lu",
         (unsigned long)(visible.count ? self.scrollOffset + 1 : 0), (unsigned long)end, (unsigned long)visible.count];
-    ITopTermPut(grid[statusRow], status, 0, font, _searching ? theme.yellow : theme.dim, nil);
+    ITopTermPut(grid[statusRow], status, 0, font, (_searching || _jumping) ? theme.yellow : theme.dim, nil);
 
     [self drawTerminalGrid:grid font:font originY:_originY];
 }
@@ -763,15 +888,35 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
 
 - (void)moveSelectionBy:(NSInteger)delta {
     if (_renderedRows.count == 0) return;
-    NSInteger current = NSNotFound;
-    for (NSUInteger i = 0; i < _renderedRows.count; i++) {
-        if (_renderedRows[i].pid == self.selectedPID) { current = (NSInteger)i; break; }
-    }
-    NSInteger next = current == NSNotFound ? 0 : MAX(0, MIN((NSInteger)_renderedRows.count - 1, current + delta));
+    NSUInteger current = ITopRowIndexOfPID(_renderedRows, self.selectedPID);
+    NSInteger next = current == NSNotFound ? 0 : (NSInteger)current + delta;
+    next = MAX(0, MIN((NSInteger)_renderedRows.count - 1, next));
     self.selectedPID = _renderedRows[(NSUInteger)next].pid;
-    NSUInteger visibleIndex = (NSUInteger)next;
-    if (visibleIndex < self.scrollOffset) self.scrollOffset = visibleIndex;
-    else if (_rowCapacity && visibleIndex >= self.scrollOffset + _rowCapacity) self.scrollOffset = visibleIndex - _rowCapacity + 1;
+    [self revealRowIndex:(NSUInteger)next];
+    [self setNeedsDisplay];
+}
+
+// Keeps the given rendered row index on screen by nudging scrollOffset only
+// when it has left the visible window.
+- (void)revealRowIndex:(NSUInteger)index {
+    if (index >= _renderedRows.count) return;
+    if (index < self.scrollOffset) {
+        self.scrollOffset = index;
+    } else if (_rowCapacity && index >= self.scrollOffset + _rowCapacity) {
+        self.scrollOffset = index - _rowCapacity + 1;
+    }
+}
+
+// Hardware PgUp/PgDn: scroll one page without changing the selection.
+- (void)scrollPageBy:(NSInteger)pages {
+    if (!pages) return;
+    self.scrollOffset = ITopPagedOffset(self.scrollOffset, pages, _renderedRows.count, _rowCapacity);
+    [self setNeedsDisplay];
+}
+
+// Hardware Home/End: jump to the very top or bottom of the visible list.
+- (void)scrollToEdge:(BOOL)bottom {
+    self.scrollOffset = bottom ? ITopScrollMaximum(_renderedRows.count, _rowCapacity) : 0;
     [self setNeedsDisplay];
 }
 
@@ -807,7 +952,7 @@ static ITopSearchTap ITopSearchTapAction(BOOL filterActive, NSInteger tagColumn,
         [self setNeedsDisplay];
         return;
     }
-    if (_searching) return;
+    if (_searching || _jumping) return;   // modal prompts: no row/header actions while typing
     if (row == 0 && _helpCol != NSNotFound && _refreshCol != NSNotFound && _fpsCol != NSNotFound) {
         if (column >= (NSUInteger)MAX(0, _helpCol - 1) && column < (NSUInteger)_refreshCol - 1) {
             [self.delegate itopShowHelp];
