@@ -741,7 +741,7 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
             [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
         ];
     }
-    NSMutableArray<UIKeyCommand *> *commands = [NSMutableArray arrayWithObjects:
+    return @[
         [UIKeyCommand keyCommandWithInput:@"s" modifierFlags:0 action:@selector(keySort)],
         [UIKeyCommand keyCommandWithInput:@"f" modifierFlags:0 action:@selector(keyFilter)],
         [UIKeyCommand keyCommandWithInput:@"j" modifierFlags:0 action:@selector(keyJump)],
@@ -749,54 +749,32 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
         [UIKeyCommand keyCommandWithInput:@"h" modifierFlags:0 action:@selector(keyHelp)],
         [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
         [UIKeyCommand keyCommandWithInput:@" " modifierFlags:0 action:@selector(keyPause)],
-        [UIKeyCommand keyCommandWithInput:@"k" modifierFlags:0 action:@selector(keySignalArm)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputUpArrow modifierFlags:0 action:@selector(keyUp)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputPageUp modifierFlags:0 action:@selector(keyPageUp)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputPageDown modifierFlags:0 action:@selector(keyPageDown)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputHome modifierFlags:0 action:@selector(keyHome)],
-        [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)],
-        nil];
-    // Fire keys exist only in the armed state, mirroring the on-screen zones.
-    if (_canvas.isSignalArmed) {
-        [commands addObjectsFromArray:@[
-            [UIKeyCommand keyCommandWithInput:@"1" modifierFlags:0 action:@selector(keySignalTerm)],
-            [UIKeyCommand keyCommandWithInput:@"9" modifierFlags:0 action:@selector(keySignalKill)],
-            [UIKeyCommand keyCommandWithInput:@"p" modifierFlags:0 action:@selector(keySignalStop)],
-            [UIKeyCommand keyCommandWithInput:@"c" modifierFlags:0 action:@selector(keySignalCont)]
-        ]];
-    }
-    return commands;
+        [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
+    ];
 }
-// While armed, every key that is not a fire key disarms instead of acting.
-- (BOOL)disarmIfArmed {
-    if (_canvas.isSignalArmed) { [_canvas disarmSignal]; return YES; }
-    return NO;
-}
-- (void)keySort { if ([self disarmIfArmed]) return; [self itopChangeSort]; }
-- (void)keyFilter { if ([self disarmIfArmed]) return; [self itopChangeFilter]; }
-- (void)keyJump { if ([self disarmIfArmed]) return; [self itopBeginJump]; }
-- (void)keyRefresh { if ([self disarmIfArmed]) return; [self itopRefresh]; }
-- (void)keyHelp { if ([self disarmIfArmed]) return; [self itopShowHelp]; }
+- (void)keySort { [self itopChangeSort]; }
+- (void)keyFilter { [self itopChangeFilter]; }
+- (void)keyJump { [self itopBeginJump]; }
+- (void)keyRefresh { [self itopRefresh]; }
+- (void)keyHelp { [self itopShowHelp]; }
 - (void)keyEscape {
-    if ([self disarmIfArmed]) return;
     if (_canvas.isSearching) [_canvas cancelSearch];
     else if (_canvas.isJumping) [_canvas cancelJump];
     else _canvas.helpMode = NO;
     [_canvas setNeedsDisplay];
 }
-- (void)keyPause { if ([self disarmIfArmed]) return; [self itopTogglePause]; }
-- (void)keyUp { if ([self disarmIfArmed]) return; [_canvas moveSelectionBy:-1]; }
-- (void)keyDown { if ([self disarmIfArmed]) return; [_canvas moveSelectionBy:1]; }
-- (void)keyPageUp { if ([self disarmIfArmed]) return; [_canvas scrollPageBy:-1]; }
-- (void)keyPageDown { if ([self disarmIfArmed]) return; [_canvas scrollPageBy:1]; }
-- (void)keyHome { if ([self disarmIfArmed]) return; [_canvas scrollToEdge:NO]; }
-- (void)keyEnd { if ([self disarmIfArmed]) return; [_canvas scrollToEdge:YES]; }
-- (void)keySignalArm { [_canvas toggleSignalArmed]; }
-- (void)keySignalTerm { [_canvas sendSignal:SIGTERM]; }
-- (void)keySignalKill { [_canvas sendSignal:SIGKILL]; }
-- (void)keySignalStop { [_canvas sendSignal:SIGSTOP]; }
-- (void)keySignalCont { [_canvas sendSignal:SIGCONT]; }
+- (void)keyPause { [self itopTogglePause]; }
+- (void)keyUp { [_canvas moveSelectionBy:-1]; }
+- (void)keyDown { [_canvas moveSelectionBy:1]; }
+- (void)keyPageUp { [_canvas scrollPageBy:-1]; }
+- (void)keyPageDown { [_canvas scrollPageBy:1]; }
+- (void)keyHome { [_canvas scrollToEdge:NO]; }
+- (void)keyEnd { [_canvas scrollToEdge:YES]; }
 
 - (void)updateBattery {
     _canvas.batteryLevel = UIDevice.currentDevice.batteryLevel;
@@ -937,17 +915,64 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
     }
 }
 
-// Armed fire path (touch zone or 1/9/p/c). The signal runs on the serial
-// monitor queue so a stuck process cannot block the main thread; the outcome
-// line is set on the canvas once the call returns. The guard (self/0/-1/1)
-// lives inside the monitor call, so even a UI regression cannot broadcast.
-- (void)itopSignal:(int)signalNumber {
+// Kill control (the red `kill` tag). Standard touch flow: an action sheet
+// offers Terminate / Force Kill; Force Kill confirms once more since SIGKILL
+// cannot be caught. The signal itself runs on the serial monitor queue so a
+// stuck process cannot block the main thread, and the outcome line is sticky
+// on the canvas. The guard (self/0/-1/1) lives inside the monitor call, so
+// even a UI regression cannot broadcast.
+- (void)itopKillSelected {
     pid_t pid = _canvas.selectedPID;
-    ITopSnapshot *snapshot = _canvas.snapshot;
+    if (pid <= 0) return;
     NSString *name = nil;
+    ITopSnapshot *snapshot = _canvas.snapshot;
     for (ITopProcess *process in snapshot.processes) {
         if (process.pid == pid) { name = process.name; break; }
     }
+    NSString *title = name ? [NSString stringWithFormat:@"PID %d · %@", (int)pid, name]
+                           : [NSString stringWithFormat:@"PID %d", (int)pid];
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Terminate (SIGTERM)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        [weakSelf itopRunSignal:SIGTERM toPID:pid name:name];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Force Kill (SIGKILL)"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        [weakSelf itopConfirmForceKill:pid name:name];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = _canvas;
+        sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(_canvas.bounds),
+                                                                     CGRectGetMidY(_canvas.bounds), 1, 1);
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)itopConfirmForceKill:(pid_t)pid name:(NSString *)name {
+    NSString *title = name ? [NSString stringWithFormat:@"Force kill PID %d (%@)?", (int)pid, name]
+                           : [NSString stringWithFormat:@"Force kill PID %d?", (int)pid];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:@"SIGKILL cannot be caught or ignored."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Force Kill"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        [weakSelf itopRunSignal:SIGKILL toPID:pid name:name];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// Runs the signal on the serial monitor queue; the outcome line is set on the
+// canvas once the call returns.
+- (void)itopRunSignal:(int)signalNumber toPID:(pid_t)pid name:(NSString *)name {
     // Capture name/pid now so the outcome always names them together even if
     // the process disappears (or the PID recycles) while the call runs.
     NSString *target = name ? [NSString stringWithFormat:@"%d (%@)", (int)pid, name]
