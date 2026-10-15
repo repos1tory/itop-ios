@@ -6,6 +6,7 @@
 - (void)itopBeginJump;
 - (void)itopTogglePause;
 - (void)itopRefresh;
+- (void)itopSignal:(int)signalNumber;
 @end
 
 typedef struct {
@@ -345,6 +346,14 @@ static BOOL ITopSortDescendingFor(NSString *key) {
 - (BOOL)isSearching;
 - (BOOL)isJumping;
 - (void)loadStoredSettingsFromDefaults:(NSUserDefaults *)store;
+// Signal sending is deliberately unsafe-by-default: nothing in the read-only
+// UI can signal, and even the armed state needs a second, zone-specific tap.
+@property (nonatomic, getter=isSignalArmed) BOOL signalArmed;
+- (void)toggleSignalArmed;
+- (void)disarmSignal;
+- (void)sendSignal:(int)signalNumber;
+- (void)noteSignalResult:(NSString *)text failed:(BOOL)failed;
+- (void)clearSignalResult;
 @end
 
 @implementation ITopCanvas {
@@ -375,6 +384,10 @@ static BOOL ITopSortDescendingFor(NSString *key) {
     NSInteger _fpsCol;
     NSInteger _searchTagCol;
     NSUInteger _searchTagLen;
+    NSInteger _sigTagCol;
+    NSUInteger _sigTagLen;
+    NSString *_signalResultText;
+    BOOL _signalResultFailed;
     NSUInteger _headingsRowActual;
     NSArray<NSDictionary<NSString *, id> *> *_headingZones;
 }
@@ -391,6 +404,8 @@ static BOOL ITopSortDescendingFor(NSString *key) {
         _fpsCol = NSNotFound;
         _searchTagCol = NSNotFound;
         _jumpDraft = [NSMutableString string];
+        _sigTagCol = NSNotFound;
+        _sigTagLen = 3;
         _cpuHistory = [NSMutableArray arrayWithCapacity:64];
         for (NSUInteger i = 0; i < 64; i++) [_cpuHistory addObject:@0];
         _netRxHistory = [NSMutableArray arrayWithCapacity:64];
@@ -577,7 +592,59 @@ static BOOL ITopSortDescendingFor(NSString *key) {
     self.scrollOffset = 0;
     [self pruneJumpState];
     [self resignFirstResponder];
+    _signalResultText = nil;
+    _signalResultFailed = NO;
     [self setNeedsDisplay];
+}
+
+#pragma mark Signal arming and firing
+
+- (void)toggleSignalArmed {
+    if (_searching) return;
+    if (_signalArmed) { [self disarmSignal]; return; }
+    // Arming is offered only when the highlighted row is really rendered:
+    // the fire zones target exactly the selected pid, never a recycled row.
+    if (self.selectedPID <= 0) return;
+    BOOL hasRenderedTarget = NO;
+    for (ITopProcess *process in _renderedRows) {
+        if (process.pid == self.selectedPID) { hasRenderedTarget = YES; break; }
+    }
+    if (!hasRenderedTarget) return;
+    _signalArmed = YES;
+    self.helpMode = NO;
+    _signalResultText = nil;
+    _signalResultFailed = NO;
+    [self setNeedsDisplay];
+}
+
+- (void)disarmSignal {
+    if (!_signalArmed) return;
+    _signalArmed = NO;
+    [self setNeedsDisplay];
+}
+
+// The single path that can lead to kill(2): only while armed, and it
+// auto-disarms before reporting to the delegate, which runs the signal on
+// the monitor queue. Tapping anywhere else merely disarms.
+- (void)sendSignal:(int)signalNumber {
+    if (!_signalArmed) return;
+    if (self.selectedPID <= 0) return;
+    _signalArmed = NO;
+    _signalResultText = nil;
+    _signalResultFailed = NO;
+    [self setNeedsDisplay];
+    [self.delegate itopSignal:signalNumber];
+}
+
+- (void)noteSignalResult:(NSString *)text failed:(BOOL)failed {
+    _signalResultText = [text copy];
+    _signalResultFailed = failed;
+    [self setNeedsDisplay];
+}
+
+- (void)clearSignalResult {
+    _signalResultText = nil;
+    _signalResultFailed = NO;
 }
 
 - (void)setSnapshot:(ITopSnapshot *)snapshot {
@@ -702,17 +769,22 @@ static BOOL ITopSortDescendingFor(NSString *key) {
             @"  layouts drop least-important rate fields instead of cutting numbers.",
             @"  Prs (Mem panel)   Device memory pressure 0-100 meter, n/a if iOS denies",
             @"  LIM (detail line) Per-process jetsam limit, n/a while iOS hides it",
-            @"  Zone map: header '?', header 'R', FPS readout, Tasks-bar search tag, column titles.",
+            @"  Zone map: header '?', header 'R', FPS readout, Tasks-bar sig+search tags, columns.",
             @"  ?  (header)        Open or close this help page",
             @"  R  (header)        Re-sample right now",
             @"  FPS readout        Tap to hold/resume sampling; turns amber while held",
             @"  Column titles      Tap to sort; tap again to flip ▼/▲ direction",
+            @"  sig (Tasks bar)    Arm signal sending: red border, tag reads TERM ▸ KILL",
+            @"  Bottom line        While armed: TERM | STOP CONT | KILL zones; any",
+            @"                     other tap disarms. Sending auto-disarms.",
             @"  search (Tasks bar) Tap to open/edit the filter prompt; ✕ clears it in place",
             @"  ↑ / ↓ or swipe     Select and scroll processes",
             @"  PgUp/PgDn          Scroll one page; Home/End jump to top/bottom",
             @"  J then digits      Jump: type a PID, Return selects, Esc cancels",
-            @"  Keyboard: S sort-cycle, F search, J jump, Space pause, R refresh, F1 help, Esc cancel",
-            @"  Tap a process row to select it. No process is signalled or modified by itop."
+            @"  Keyboard: S sort-cycle, F search, J jump, Space pause, R refresh, H/F1 help, Esc cancel",
+            @"  Armed: 1=TERM 9=KILL p=STOP c=CONT, K arm/disarm; all other keys disarm",
+            @"  Signals go to the selected pid only, via kill(2). Prefer TERM,",
+            @"  fall back to KILL. itop never signals itself, launchd, or broadcasts."
         ];
         NSUInteger helpRow = 4;
         for (NSString *item in help) {
@@ -939,6 +1011,7 @@ static BOOL ITopSortDescendingFor(NSString *key) {
     ITopTermPut(grid[_processStartRow], taskTitle, 3, boldFont, theme.cyan, nil);
     _searchTagCol = NSNotFound;
     _searchTagLen = 0;
+    _sigTagCol = NSNotFound;
     NSInteger searchTagColumn;
     NSUInteger searchTagLength;
     ITopSearchTagGeometry(columns, self.filterText, taskTitle.length, &searchTagColumn, &searchTagLength);
@@ -963,12 +1036,32 @@ static BOOL ITopSortDescendingFor(NSString *key) {
             ITopTermPut(grid[_processStartRow], text, (NSInteger)partColumn, boldFont, color, nil);
             partColumn += text.length;
         }
+        // Signal arm zone, right-aligned one dead gap-column left of search.
+        // Normal: a quiet dim "sig" tag. Armed: the tag reads "TERM ▸ KILL" as
+        // a legend (yellow/red spans). While armed any tap on this row
+        // disarms, so the legend is deliberately not a fire button itself.
+        NSInteger sigSlotColumn = searchTagColumn - 4;
+        if (_signalArmed) sigSlotColumn = searchTagColumn - 12;
+        if (sigSlotColumn > (NSInteger)taskTitle.length + 4) {
+            _sigTagCol = sigSlotColumn;
+            _sigTagLen = _signalArmed ? 11 : 3;
+            if (_signalArmed) {
+                ITopTermPut(grid[_processStartRow], @"TERM", sigSlotColumn, boldFont, theme.yellow, nil);
+                ITopTermPut(grid[_processStartRow], @" ▸ ", sigSlotColumn + 4, boldFont, theme.dim, nil);
+                ITopTermPut(grid[_processStartRow], @"KILL", sigSlotColumn + 7, boldFont, theme.red, nil);
+            } else {
+                ITopTermPut(grid[_processStartRow], @"sig", sigSlotColumn, boldFont, theme.dim, nil);
+            }
+        }
     }
     NSUInteger headingsRow = _processStartRow + 1;
     NSUInteger separatorRow = _processStartRow + 2;
     _processDataStartRow = _processStartRow + 3;
     NSUInteger statusRow = _footerRow;
     _rowCapacity = statusRow > _processDataStartRow ? statusRow - _processDataStartRow : 0;
+    // While armed the last data row shows the ARMED notice, the bottom line
+    // is the TERM/STOP/CONT/KILL zone row; shrink the list, never overwrite.
+    if (_signalArmed && _rowCapacity > 0) _rowCapacity--;
     NSUInteger maximumOffset = ITopScrollMaximum(visible.count, _rowCapacity);
     self.scrollOffset = MIN(self.scrollOffset, maximumOffset);
 
@@ -1051,10 +1144,28 @@ static BOOL ITopSortDescendingFor(NSString *key) {
     }
 
     NSString *status;
-    if (_searching) status = [NSString stringWithFormat:@"Search: %@_   Return: accept   Esc: cancel", _searchDraft ?: @""];
-    else if (_jumping) status = _jumpMiss ?
-        [NSString stringWithFormat:@"jump: %@?  no such pid  Return jump  Esc cancel", _jumpDraft ?: @""] :
-        [NSString stringWithFormat:@"jump: %@?  Return jump  Esc cancel", _jumpDraft.length ? _jumpDraft : @"pid"];
+    UIColor *statusColor = theme.dim;
+    BOOL armedNotice = NO;
+    if (_searching) {
+        status = [NSString stringWithFormat:@"Search: %@_   Return: accept   Esc: cancel", _searchDraft ?: @""];
+        statusColor = theme.yellow;
+    } else if (_jumping) {
+        status = _jumpMiss ?
+            [NSString stringWithFormat:@"jump: %@?  no such pid  Return jump  Esc cancel", _jumpDraft ?: @""] :
+            [NSString stringWithFormat:@"jump: %@?  Return jump  Esc cancel", _jumpDraft.length ? _jumpDraft : @"pid"];
+        statusColor = theme.yellow;
+    } else if (_signalArmed) {
+        // The armed notice replaces the selection detail; the bottom line
+        // itself becomes the TERM/STOP/CONT/KILL zone row (drawn below).
+        status = [NSString stringWithFormat:
+            @"ARMED: tap TERM or KILL below to signal PID %d  ·  tap elsewhere to disarm",
+            (int)self.selectedPID];
+        statusColor = theme.red;
+        armedNotice = YES;
+    } else if (_signalResultText) {
+        status = _signalResultText;
+        statusColor = _signalResultFailed ? theme.red : theme.green;
+    }
     else if (!self.snapshot.processAccess) status = @"ERROR: process-info access denied; check jailbreak signing entitlements";
     else if (visible.count == 0 && self.snapshot.processCount > 0) status = @"No readable processes; check PROC_PIDTASKALLINFO entitlement/ABI";
     else if (visible.count == 0) status = @"No matching processes";
@@ -1100,7 +1211,27 @@ static BOOL ITopSortDescendingFor(NSString *key) {
         }
     } else status = [NSString stringWithFormat:@"Showing %lu-%lu of %lu",
         (unsigned long)(visible.count ? self.scrollOffset + 1 : 0), (unsigned long)end, (unsigned long)visible.count];
-    ITopTermPut(grid[statusRow], status, 0, font, (_searching || _jumping) ? theme.yellow : theme.dim, nil);
+    if (armedNotice) {
+        // Armed notice on the row above the zone row ("tap ... below").
+        NSUInteger armedNoticeRow = statusRow > 0 ? statusRow - 1 : 0;
+        ITopTermPut(grid[armedNoticeRow], status, 1, boldFont, statusColor, nil);
+        // Bottom line: one-cell red border ends plus the fire zone labels.
+        ITopTermPut(grid[statusRow], ITopTermBorder(columns, @"", NO), 0, font, theme.red, nil);
+        ITopTermPut(grid[statusRow], @"TERM", 2, boldFont, theme.yellow, nil);
+        ITopTermPut(grid[statusRow], @"KILL", (NSInteger)columns - 5, boldFont, theme.red, nil);
+        NSUInteger stopColumn = columns >= 26 ? (columns - 10) / 2 : 0;
+        if (columns >= 26) {
+            ITopTermPut(grid[statusRow], @"STOP", (NSInteger)stopColumn, boldFont, theme.cyan, nil);
+            ITopTermPut(grid[statusRow], @"CONT", (NSInteger)(stopColumn + 6), boldFont, theme.cyan, nil);
+        }
+        // Full-canvas perimeter: bright red, one cell thick, drawn on top.
+        // The next redraw (any state change or 1 Hz sample) restores normal.
+        ITopTermPut(grid[0], ITopTermBorder(columns, @"", YES), 0, boldFont, theme.red, nil);
+        for (NSUInteger borderRow = 1; borderRow < statusRow; borderRow++)
+            ITopTermBoxSides(grid[borderRow], 0, columns, font, theme.red);
+    } else {
+        ITopTermPut(grid[statusRow], status, 0, font, statusColor, nil);
+    }
 
     [self drawTerminalGrid:grid font:font originY:_originY];
 }
@@ -1120,6 +1251,7 @@ static BOOL ITopSortDescendingFor(NSString *key) {
     next = MAX(0, MIN((NSInteger)_renderedRows.count - 1, next));
     self.selectedPID = _renderedRows[(NSUInteger)next].pid;
     [self revealRowIndex:(NSUInteger)next];
+    [self clearSignalResult];
     [self setNeedsDisplay];
 }
 
@@ -1154,6 +1286,13 @@ static BOOL ITopSortDescendingFor(NSString *key) {
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (_signalArmed) {
+        // Armed is modal: the list cannot scroll away underneath. A real drag
+        // is marked as moved so it can never land as a tap on a fire zone.
+        CGPoint dragged = [[touches anyObject] locationInView:self];
+        if (fabs(dragged.y - _touchStart.y) > 10) _didMove = YES;
+        return;
+    }
     CGPoint point = [[touches anyObject] locationInView:self];
     CGFloat processTop = _originY + _processDataStartRow * _lineHeight;
     CGFloat footerTop = _originY + _footerRow * _lineHeight;
@@ -1180,6 +1319,33 @@ static BOOL ITopSortDescendingFor(NSString *key) {
         return;
     }
     if (_searching || _jumping) return;   // modal prompts: no row/header actions while typing
+    // Armed is a modal, dangerous state: the ONLY live taps are the fire
+    // zones on the bottom line; every other tap (rows, header, tags, border)
+    // disarms harmlessly. Stray taps can therefore never signal anything.
+    if (_signalArmed) {
+        if (_didMove) { [self disarmSignal]; return; }   // drags disarm, they never fire
+        if (row == _footerRow) {
+            NSUInteger zoneColumns = _terminalColumns;
+            NSUInteger zoneHalf = zoneColumns / 2;
+            NSUInteger stopColumn = zoneColumns >= 26 ? (zoneColumns - 10) / 2 : 0;
+            if (column == 0 || column >= zoneColumns - 1) {
+                [self disarmSignal];        // border cells are dead zones
+            } else if (zoneColumns >= 26 && column < zoneHalf &&
+                       column >= stopColumn && column < stopColumn + 4) {
+                [self sendSignal:SIGSTOP];
+            } else if (zoneColumns >= 26 && column >= zoneHalf &&
+                       column >= stopColumn + 6 && column < stopColumn + 10) {
+                [self sendSignal:SIGCONT];
+            } else if (column < zoneHalf) {
+                [self sendSignal:SIGTERM];
+            } else {
+                [self sendSignal:SIGKILL];
+            }
+        } else {
+            [self disarmSignal];
+        }
+        return;
+    }
     if (row == 0 && _helpCol != NSNotFound && _refreshCol != NSNotFound && _fpsCol != NSNotFound) {
         if (column >= (NSUInteger)MAX(0, _helpCol - 1) && column < (NSUInteger)_refreshCol - 1) {
             [self.delegate itopShowHelp];
@@ -1190,14 +1356,21 @@ static BOOL ITopSortDescendingFor(NSString *key) {
         }
         return;
     }
-    if (row == _processStartRow && _searchTagCol != NSNotFound) {
-        // In-place filter editing: tapping the tag reopens the prompt seeded
-        // with the current text; the trailing " ✕" (last 2 cells) clears it
-        // in place without raising the keyboard.
-        ITopSearchTap action = ITopSearchTapAction(self.filterText.length > 0,
-                                                   _searchTagCol, _searchTagLen, column);
-        if (action == ITopSearchTapClear) [self clearFilter];
-        else if (action == ITopSearchTapEdit) [self.delegate itopChangeFilter];
+    if (row == _processStartRow) {
+        if (_sigTagCol != NSNotFound && column >= (NSUInteger)_sigTagCol &&
+            column < (NSUInteger)(_sigTagCol + _sigTagLen)) {
+            [self toggleSignalArmed];
+            return;
+        }
+        if (_searchTagCol != NSNotFound) {
+            // In-place filter editing: tapping the tag reopens the prompt seeded
+            // with the current text; the trailing " ✕" (last 2 cells) clears it
+            // in place without raising the keyboard.
+            ITopSearchTap action = ITopSearchTapAction(self.filterText.length > 0,
+                                                       _searchTagCol, _searchTagLen, column);
+            if (action == ITopSearchTapClear) [self clearFilter];
+            else if (action == ITopSearchTapEdit) [self.delegate itopChangeFilter];
+        }
         return;
     }
     if (row == _headingsRowActual) {
@@ -1216,6 +1389,7 @@ static BOOL ITopSortDescendingFor(NSString *key) {
                                           [zoneKey isEqualToString:@"TIME+"];
                 }
                 self.scrollOffset = 0;
+                [self clearSignalResult];
                 [self setNeedsDisplay];
                 return;
             }
@@ -1226,6 +1400,7 @@ static BOOL ITopSortDescendingFor(NSString *key) {
         NSUInteger index = self.scrollOffset + row - _processDataStartRow;
         if (index < _renderedRows.count) {
             self.selectedPID = _renderedRows[index].pid;
+            [self clearSignalResult];
             [self setNeedsDisplay];
         }
     }

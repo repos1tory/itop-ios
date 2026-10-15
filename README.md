@@ -30,8 +30,35 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
   jetsam-headroom row; LIM appears (honestly, never fabricated) at the end of
   the selected-row detail line.
 - Terminal key bar, touch row selection, swipe scrolling, and hardware keyboard shortcuts.
-- Process information entitlements are limited to enumeration/inspection; itop does not kill or modify processes.
+- Process information entitlements are limited to enumeration/inspection. Sending signals
+  is the one deliberate exception and is always opt-in (see *Dangerous actions* below).
 - iPhone and iPad layouts; deployment target iOS 15; arm64 package.
+
+### Dangerous actions
+
+itop can send SIGTERM, SIGKILL, SIGSTOP, or SIGCONT to the selected process, but the
+read-only posture is kept for everything accidental:
+
+- Nothing can be signalled from the normal UI: no swipes, no row long-press, and the
+  row tap only selects. The bottom line normally never offers any signal zone.
+- Sending is two-step. Tap the right-aligned `sig` tag in the Tasks bar (or press `K`)
+  to **arm**: the tag reads `TERM ▸ KILL`, the whole terminal gets a bright red
+  one-cell border, and the status line reads
+  `ARMED: tap TERM or KILL below to signal PID <pid> · tap elsewhere to disarm`.
+- Only while armed, the bottom line splits into hit zones: left `TERM` (yellow),
+  center `STOP`/`CONT` (cyan), right `KILL` (red). The signal fires on this armed
+  second tap and the state auto-disarms. Any other tap (the tags, header zones,
+  rows, the border) disarms harmlessly; drags never fire. `Esc` also disarms, and
+  while armed all other keys (S/F/R/H/Space/arrows) disarm instead of acting.
+- The outcome prints in the status line as `SIGTERM -> 4486 (zsh): ok` or
+  `failed: <errno message>` (e.g. `No such process` for a pid that exited).
+- Prefer `TERM` and give the process a moment to exit; `KILL` is the last resort.
+- Guard rails in code: itop refuses to signal itself, `launchd` (pid 1), and any
+  broadcast form of kill(2) (`pid 0`, negative pids/pid -1). The guard is a pure
+  function asserted by `--self-test`, which never calls kill(2) at all.
+- Signing: the ad-hoc ldid signature adds a single `(allow signal)` entry to the
+  existing sbpl exception list so kill(2) can reach other processes; every other
+  entitlement is unchanged.
 
 ## memorystatus ABI audit (Prs / LIM)
 
@@ -77,7 +104,9 @@ The bottom function-key bar is gone; its actions are integrated into the UI and 
   while a filter is active it becomes `search:<text> ✕` — tapping the tag reopens
   the prompt pre-seeded with the current text for in-place editing (htop F4
   style), and tapping `✕` clears the filter without raising the keyboard.
-- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, J jump, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection, PgUp/PgDn to scroll one page, and Home/End to jump to the top or bottom of the list.
+  Immediately left of `search` (one dead gap cell) sits the `sig` arm tag for
+  signals; see *Dangerous actions*.
+- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, J jump, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection, PgUp/PgDn to scroll one page, Home/End to jump to the top or bottom of the list, and K to arm/disarm signals (while armed: 1 TERM, 9 KILL, p STOP, c CONT; every other key disarms).
 - Pressing `J` opens a terminal jump prompt in the status-line region: type a PID and press Return to select it and scroll it into view, or Esc to cancel. Typing an unknown PID reports `no such pid` in the hint. Scrolling still works while the prompt is open.
 
 ## Per-process network bytes: on-device audit
