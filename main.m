@@ -664,25 +664,51 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
     if (_canvas.isSearching) return @[];
+    if (_canvas.isJumping) {
+        // Jump prompt is modal: Esc cancels, but paging still works so the
+        // user can review rows while choosing a PID; digits flow to insertText.
+        return @[
+            [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputPageUp modifierFlags:0 action:@selector(keyPageUp)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputPageDown modifierFlags:0 action:@selector(keyPageDown)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputHome modifierFlags:0 action:@selector(keyHome)],
+            [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
+        ];
+    }
     return @[
         [UIKeyCommand keyCommandWithInput:@"s" modifierFlags:0 action:@selector(keySort)],
         [UIKeyCommand keyCommandWithInput:@"f" modifierFlags:0 action:@selector(keyFilter)],
+        [UIKeyCommand keyCommandWithInput:@"j" modifierFlags:0 action:@selector(keyJump)],
         [UIKeyCommand keyCommandWithInput:@"r" modifierFlags:0 action:@selector(keyRefresh)],
         [UIKeyCommand keyCommandWithInput:@"h" modifierFlags:0 action:@selector(keyHelp)],
         [UIKeyCommand keyCommandWithInput:ITopEscapeKey() modifierFlags:0 action:@selector(keyEscape)],
         [UIKeyCommand keyCommandWithInput:@" " modifierFlags:0 action:@selector(keyPause)],
         [UIKeyCommand keyCommandWithInput:UIKeyInputUpArrow modifierFlags:0 action:@selector(keyUp)],
-        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)]
+        [UIKeyCommand keyCommandWithInput:UIKeyInputDownArrow modifierFlags:0 action:@selector(keyDown)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputPageUp modifierFlags:0 action:@selector(keyPageUp)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputPageDown modifierFlags:0 action:@selector(keyPageDown)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputHome modifierFlags:0 action:@selector(keyHome)],
+        [UIKeyCommand keyCommandWithInput:UIKeyInputEnd modifierFlags:0 action:@selector(keyEnd)]
     ];
 }
 - (void)keySort { [self itopChangeSort]; }
 - (void)keyFilter { [self itopChangeFilter]; }
+- (void)keyJump { [self itopBeginJump]; }
 - (void)keyRefresh { [self itopRefresh]; }
 - (void)keyHelp { [self itopShowHelp]; }
-- (void)keyEscape { if (_canvas.isSearching) [_canvas cancelSearch]; else _canvas.helpMode = NO; [_canvas setNeedsDisplay]; }
+- (void)keyEscape {
+    if (_canvas.isSearching) [_canvas cancelSearch];
+    else if (_canvas.isJumping) [_canvas cancelJump];
+    else _canvas.helpMode = NO;
+    [_canvas setNeedsDisplay];
+}
 - (void)keyPause { [self itopTogglePause]; }
 - (void)keyUp { [_canvas moveSelectionBy:-1]; }
 - (void)keyDown { [_canvas moveSelectionBy:1]; }
+- (void)keyPageUp { [_canvas scrollPageBy:-1]; }
+- (void)keyPageDown { [_canvas scrollPageBy:1]; }
+- (void)keyHome { [_canvas scrollToEdge:NO]; }
+- (void)keyEnd { [_canvas scrollToEdge:YES]; }
 
 - (void)updateBattery {
     _canvas.batteryLevel = UIDevice.currentDevice.batteryLevel;
@@ -780,6 +806,7 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
 
 - (void)itopShowHelp {
     if (_canvas.isSearching) [_canvas cancelSearch];
+    if (_canvas.isJumping) [_canvas cancelJump];
     _canvas.helpMode = !_canvas.helpMode;
     [_canvas setNeedsDisplay];
 }
@@ -799,6 +826,11 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
 - (void)itopChangeFilter {
     _canvas.helpMode = NO;
     [_canvas beginSearch];
+}
+
+- (void)itopBeginJump {
+    _canvas.helpMode = NO;
+    [_canvas beginJump];
 }
 
 - (void)itopTogglePause {
@@ -834,8 +866,24 @@ static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
 }
 @end
 
+// Self-test expectation helper: prints nothing on success, one terse line on
+// failure, and returns 1 so callers can accumulate a failure count.
+static int ITopExpect(BOOL condition, const char *what) {
+    if (!condition) {
+        printf("  FAIL: %s\n", what);
+        return 1;
+    }
+    return 0;
+}
+
 static int ITopSelfTest(void) {
     @autoreleasepool {
+        // Persistence hygiene: every canvas test runs against a throwaway
+        // "itop-test" suite, never the standard user defaults, and the domain
+        // is dropped in @finally even when a check returns early.
+        [NSUserDefaults.standardUserDefaults removePersistentDomainForName:@"itop-test"];  // stale-domain guard
+        NSUserDefaults *testSuite = [[NSUserDefaults alloc] initWithSuiteName:@"itop-test"];
+        @try {
         ITopMonitor *monitor = [ITopMonitor new];
         ITopSnapshot *snapshot = [monitor collect];
         printf("itop smoke test\n");
@@ -1037,7 +1085,163 @@ static int ITopSelfTest(void) {
         } else {
             printf("PASS: Mach CPU/memory, proc_info enumeration, and diagnostic sampling are available\n");
         }
+
+        // ------------------------------------------------------------------
+        // TASK A self-check: in-place filter editing (htop F4-style).
+        // Verifies the shared search-tag geometry + tap classification at
+        // narrow (~70), wide (~130) and degenerate column counts, then the
+        // canvas-level edit round trip (tap-to-edit reopens with current text,
+        // Return accepts, cancel preserves, ✕/clearFilter clears).
+        // ------------------------------------------------------------------
+        int failures = 0;
+        printf("filter-tap self-check\n");
+        NSInteger tagColumn;
+        NSUInteger tagLength;
+        ITopSearchTagGeometry(100, @"spring", 15, &tagColumn, &tagLength);
+        // "search:" (7) + "spring" (6) + " ✕" (2) = 15 cells, right-aligned at columns-16.
+        failures += ITopExpect(tagColumn == 84 && tagLength == 15, "geometry: search:spring at 100 cols");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 84) == ITopSearchTapEdit &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 90) == ITopSearchTapEdit,
+                               "tap: interior cells route to edit");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 97) == ITopSearchTapClear &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 98) == ITopSearchTapClear,
+                               "tap: last 2 cells are the ✕ clear zone");
+        failures += ITopExpect(ITopSearchTapAction(YES, tagColumn, tagLength, 83) == ITopSearchTapNone &&
+                               ITopSearchTapAction(YES, tagColumn, tagLength, 99) == ITopSearchTapNone,
+                               "tap: cells outside the tag are inert");
+        failures += ITopExpect(ITopSearchTapAction(NO, 93, 6, 93) == ITopSearchTapEdit,
+                               "tap: idle search tag always edits (no ✕ exists)");
+        ITopSearchTagGeometry(70, @"spring", 15, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == 54 && tagLength == 15, "geometry: narrow ~70 col layout");
+        ITopSearchTagGeometry(130, @"spring", 15, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == 114 && tagLength == 15, "geometry: wide ~130 col layout");
+        ITopSearchTagGeometry(24, [@"x" stringByPaddingToLength:40 withString:@"x" startingAtIndex:0],
+                              5, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == NSNotFound, "geometry: oversized filter hides the tag (no wrap/negative)");
+        ITopSearchTagGeometry(70, @"", 64, &tagColumn, &tagLength);
+        failures += ITopExpect(tagColumn == NSNotFound, "geometry: tag hidden when it would collide with the title");
+        ITopCanvas *filterCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 1024, 768)];
+        filterCanvas.settingStore = testSuite;
+        [filterCanvas loadStoredSettingsFromDefaults:testSuite];   // deterministic empty baseline
+        [filterCanvas beginSearch];
+        failures += ITopExpect(filterCanvas.isSearching, "edit: keyboard prompt opens from empty");
+        [filterCanvas insertText:@"spring"];
+        [filterCanvas insertText:@"\n"];
+        failures += ITopExpect(!filterCanvas.isSearching && [filterCanvas.filterText isEqualToString:@"spring"],
+                               "edit: Return accepts the typed filter");
+        [filterCanvas beginSearch];          // tap to edit an existing filter (F4 flow)
+        failures += ITopExpect(filterCanvas.isSearching, "edit: reopen with an active filter");
+        [filterCanvas cancelSearch];
+        failures += ITopExpect(!filterCanvas.isSearching && [filterCanvas.filterText isEqualToString:@"spring"],
+                               "edit: Esc keeps the previously accepted filter");
+        [filterCanvas clearFilter];          // the ✕ tap path
+        failures += ITopExpect(!filterCanvas.isSearching && filterCanvas.filterText.length == 0,
+                               "clear: ✕ clears in place without keyboard");
+        if (failures) {
+            fprintf(stderr, "FAIL: filter-tap self-check: %d assertion(s) failed\n", failures);
+            return 1;
+        }
+        printf("  filter geometry + in-place edit flow: ok\n");
+
+        // ------------------------------------------------------------------
+        // TASK B self-check: paging and jump-by-PID math on fabricated rows.
+        // ------------------------------------------------------------------
+        printf("paging & jump self-check\n");
+        NSMutableArray<ITopProcess *> *probe = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 50; i++) {
+            ITopProcess *process = [ITopProcess new];
+            process.pid = (pid_t)(1000 + i);
+            process.name = @"probe";
+            process.cpu = (double)i;
+            [probe addObject:process];
+        }
+        failures = 0;
+        // Page clamping: 50 rows in a 10-row viewport -> offset window [0,40].
+        failures += ITopExpect(ITopScrollMaximum(50, 10) == 40, "page: max offset for 50 rows/10 viewport");
+        failures += ITopExpect(ITopScrollClamp(100, 50, 10) == 40, "page: bottom overshoot clamps to 40");
+        failures += ITopExpect(ITopScrollClamp(0, 10, 10) == 0, "page: list shorter than viewport never scrolls");
+        failures += ITopExpect(ITopPagedOffset(20, 1, 50, 10) == 30, "page: PgDn advances one page");
+        failures += ITopExpect(ITopPagedOffset(20, -1, 50, 10) == 10, "page: PgUp backs up one page");
+        failures += ITopExpect(ITopPagedOffset(5, -1, 50, 10) == 0, "page: PgUp stops at top (no underflow)");
+        failures += ITopExpect(ITopPagedOffset(35, 1, 50, 10) == 40, "page: PgDn stops at bottom");
+        failures += ITopExpect(ITopPagedOffset(7, 1, 50, 0) == 7, "page: zero-capacity before first layout is inert");
+        failures += ITopExpect(ITopScrollMaximum(0, 0) == 0, "page: empty list stays at offset 0");
+        // Jump lookup over the fabricated visible rows (PIDs 1000..1049).
+        failures += ITopExpect(ITopRowIndexOfPID(probe, 1023) == 23, "jump: existing PID found at its index");
+        failures += ITopExpect(ITopRowIndexOfPID(probe, 7) == NSNotFound, "jump: absent PID reports not-found");
+        failures += ITopExpect(ITopJumpTargetPID(@"312") == 312, "jump: digits parse to a PID");
+        failures += ITopExpect(ITopJumpTargetPID(@"") == 0, "jump: empty draft commits to nothing");
+        failures += ITopExpect(ITopJumpTargetPID(@"-5") == 0, "jump: negative/invalid draft rejected");
+        failures += ITopExpect(ITopJumpTargetPID(@"99999999999999") == 0, "jump: overflow draft rejected");
+        // End-to-end prompt cycle: begin, type, commit to a real PID, then miss.
+        ITopCanvas *jumpCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 1024, 768)];
+        jumpCanvas.settingStore = testSuite;
+        [jumpCanvas loadStoredSettingsFromDefaults:testSuite];
+        ITopSnapshot *probeSnapshot = [ITopSnapshot new];
+        probeSnapshot.processes = probe;
+        probeSnapshot.processCount = probe.count;
+        jumpCanvas.snapshot = probeSnapshot;
+        [jumpCanvas beginJump];
+        failures += ITopExpect(jumpCanvas.isJumping && !jumpCanvas.isSearching, "jump: J opens the prompt");
+        [jumpCanvas insertText:@"1023"];
+        [jumpCanvas insertText:@"\n"];
+        failures += ITopExpect(jumpCanvas.selectedPID == 1023 && !jumpCanvas.isJumping, "jump: Return selects and closes");
+        [jumpCanvas beginJump];
+        [jumpCanvas insertText:@"7"];
+        [jumpCanvas insertText:@"\n"];
+        failures += ITopExpect(jumpCanvas.isJumping && jumpCanvas.selectedPID == 1023, "jump: miss keeps prompt and selection");
+        [jumpCanvas cancelJump];
+        failures += ITopExpect(!jumpCanvas.isJumping && jumpCanvas.isSearching == NO, "jump: Esc closes the prompt");
+        if (failures) {
+            fprintf(stderr, "FAIL: paging & jump self-check: %d assertion(s) failed\n", failures);
+            return 1;
+        }
+        printf("  paging clamps and jump-to-PID: ok\n");
+
+        // ------------------------------------------------------------------
+        // TASK C self-check: persisted settings round trip with validation.
+        // A known configuration is written into the throwaway "itop-test"
+        // suite, loaded back through the canvas, then garbage is fed in and
+        // the defaults must take over. The @finally at function scope drops
+        // the suite domain after this block (and on any early return).
+        // ------------------------------------------------------------------
+        printf("settings persistence self-check\n");
+        failures = 0;
+        [testSuite setObject:@"Command" forKey:ITopDefaultsSortKey];
+        [testSuite setBool:YES forKey:ITopDefaultsSortDesc];       // non-default: Command usually sorts ascending
+        [testSuite setObject:@"launchd" forKey:ITopDefaultsFilter];
+        ITopCanvas *loadedCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 800, 600)];
+        loadedCanvas.settingStore = testSuite;
+        [loadedCanvas loadStoredSettingsFromDefaults:testSuite];
+        failures += ITopExpect([loadedCanvas.sortKey isEqualToString:@"Command"], "settings: sort key round trip");
+        failures += ITopExpect(loadedCanvas.sortDescending == YES, "settings: stored direction beats per-key default");
+        failures += ITopExpect([loadedCanvas.filterText isEqualToString:@"launchd"], "settings: filter round trip");
+        failures += ITopExpect([[testSuite stringForKey:ITopDefaultsSortKey] isEqualToString:@"Command"],
+                               "settings: loading does not rewrite the store");
+        [testSuite setObject:@"EVIL" forKey:ITopDefaultsSortKey];
+        [testSuite setObject:@[ @"garbage" ] forKey:ITopDefaultsSortDesc];
+        [testSuite setObject:@[ @"garbage" ] forKey:ITopDefaultsFilter];
+        ITopCanvas *garbageCanvas = [[ITopCanvas alloc] initWithFrame:CGRectMake(0, 0, 800, 600)];
+        garbageCanvas.settingStore = testSuite;
+        [garbageCanvas loadStoredSettingsFromDefaults:testSuite];
+        failures += ITopExpect([garbageCanvas.sortKey isEqualToString:@"CPU%"] && garbageCanvas.sortDescending == YES,
+                               "settings: unknown sort key degrades to CPU% descending");
+        failures += ITopExpect(garbageCanvas.filterText.length == 0, "settings: non-string filter degrades to empty");
+        garbageCanvas.sortKey = @"PID";                            // change-driven writes
+        failures += ITopExpect([[testSuite stringForKey:ITopDefaultsSortKey] isEqualToString:@"PID"],
+                               "settings: sort change is persisted on change");
+        garbageCanvas.sortDescending = NO;
+        failures += ITopExpect([testSuite boolForKey:ITopDefaultsSortDesc] == NO,
+                               "settings: direction change is persisted on change");
+        if (failures) {
+            fprintf(stderr, "FAIL: settings persistence self-check: %d assertion(s) failed\n", failures);
+            return 1;
+        }
+        printf("  persistent sort/filter + validation: ok\n");
         return 0;
+        } @finally {
+            [testSuite removePersistentDomainForName:@"itop-test"];
+        }
     }
 }
 

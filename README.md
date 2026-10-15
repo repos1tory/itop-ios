@@ -7,6 +7,9 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
 - Overall and per-core CPU load with a short history graph.
 - Physical memory, wired/compressed memory, root filesystem usage, uptime, and battery.
 - Read-only process list with CPU and resident memory, sorting, name/PID filtering, row selection, and scrolling.
+- Persisted view settings: the active sort key and direction and the filter text are saved to `NSUserDefaults`
+  (`itop.sort.key`, `itop.sort.desc`, `itop.filter`) and validated on load, so a relaunch keeps the user's view.
+  Paused state is deliberately transient and is not persisted.
 - Diagnostics panel: itop energy use, thermal state, Wi-Fi/cellular RX/TX rates,
   collection time, and jetsam headroom for this process (shown as n/a when the
   runtime does not provide a value). Selecting a row adds per-process energy
@@ -70,8 +73,12 @@ The bottom function-key bar is gone; its actions are integrated into the UI and 
 
 - Header row: `?` opens help, `R` re-samples now, and tapping the **FPS** readout holds or resumes sampling (it turns amber while held).
 - Column titles are sort buttons: tap to sort by that column, tap again to flip `▼/▲` direction. The active column shows the arrow in green.
-- Tasks bar: the right-aligned `search` tag opens the terminal filter prompt; while a filter is active it becomes `search:<text> ✕` where `✕` clears it.
-- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection.
+- Tasks bar: the right-aligned `search` tag opens the terminal filter prompt;
+  while a filter is active it becomes `search:<text> ✕` — tapping the tag reopens
+  the prompt pre-seeded with the current text for in-place editing (htop F4
+  style), and tapping `✕` clears the filter without raising the keyboard.
+- Row swiping, row selection, and the status line are unchanged. Hardware keys still work: S sort-cycle, F search, J jump, Space pause, R refresh, H/F1 help, Esc cancel, arrows to move selection, PgUp/PgDn to scroll one page, and Home/End to jump to the top or bottom of the list.
+- Pressing `J` opens a terminal jump prompt in the status-line region: type a PID and press Return to select it and scroll it into view, or Esc to cancel. Typing an unknown PID reports `no such pid` in the hint. Scrolling still works while the prompt is open.
 
 ## Per-process network bytes: on-device audit
 
