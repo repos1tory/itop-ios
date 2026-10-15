@@ -10,7 +10,10 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
 - Diagnostics panel: itop energy use, thermal state, Wi-Fi/cellular RX/TX rates,
   collection time, and jetsam headroom for this process (shown as n/a when the
   runtime does not provide a value). Selecting a row adds per-process energy
-  plus fault, page-in, context-switch, and syscall rates in the status line.
+  plus fault, page-in, context-switch, and syscall rates in the status line,
+  and shows per-process disk read/write rates for the selected row (cumulative
+  totals on wide layouts; narrow layouts drop the least important rate fields
+  rather than cutting numbers).
 - Device RX/TX sparklines: when the compact layout leaves a spare CPU-panel
   interior row (≤ 3 exposed cores; 2 on the test device), a `RX ▂▅█▄▂▁▃  TX ▁▂▄▆▃▁▂` row
   built from the same ▁▂▃▄▅▆▇█ sparkline charset as the CPU history draws

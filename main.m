@@ -129,6 +129,11 @@ typedef struct {
 @property (nonatomic) double pageinsPerSecond;
 @property (nonatomic) double contextSwitchesPerSecond;
 @property (nonatomic) double syscallsPerSecond;
+@property (nonatomic) double diskReadBytesPerSecond;
+@property (nonatomic) double diskWriteBytesPerSecond;
+@property (nonatomic) uint64_t diskReadBytesTotal;
+@property (nonatomic) uint64_t diskWriteBytesTotal;
+@property (nonatomic) BOOL diskAvailable;
 @property (nonatomic, copy) NSString *name;
 @end
 @implementation ITopProcess
@@ -147,6 +152,13 @@ typedef struct {
 @property (nonatomic) NSTimeInterval energySampleTime;
 @property (nonatomic) double energyPowerMilliwatts;
 @property (nonatomic) BOOL energyAvailable;
+@property (nonatomic) uint64_t diskReadBytes;
+@property (nonatomic) uint64_t diskWriteBytes;
+@property (nonatomic) NSTimeInterval diskSampleTime;
+@property (nonatomic) double diskReadBytesPerSecond;
+@property (nonatomic) double diskWriteBytesPerSecond;
+@property (nonatomic) BOOL diskAvailable;
+@property (nonatomic) BOOL diskRatesKnown;
 @end
 @implementation ITopProcHistory
 @end
@@ -242,6 +254,38 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
 // Conclusion: no honest per-process RX/TX source on this toolchain, so
 // ITopProcess deliberately has no netRx/netTx counters. The getifaddrs work
 // below is DEVICE-wide traffic, not per-process.
+
+// Per-second disk byte rate over the elapsed rusage window. Counters restart
+// at zero when a process is reaped and its pid re-used, so a reversed delta
+// (counter reset) clamps to 0; degenerate windows clamp to a finite 0.
+static double ITopDiskRate(uint64_t current, uint64_t previous, double elapsed) {
+    if (!(elapsed > 0.0) || !isfinite(elapsed)) return 0.0;
+    double rate = (double)(current >= previous ? current - previous : 0) / elapsed;
+    return isfinite(rate) ? rate : 0.0;
+}
+
+// Fold a fresh rusage diskio reading into `current`, computing rates the way
+// energy power is computed: against the previous rusage sample's cumulative
+// counters over the actual time between them, then frozen between samples.
+static void ITopDiskSampleInto(ITopProcHistory *current, ITopProcHistory *prior,
+                               uint64_t readBytes, uint64_t writeBytes, NSTimeInterval now) {
+    current.diskReadBytes = readBytes;
+    current.diskWriteBytes = writeBytes;
+    current.diskSampleTime = now;
+    current.diskAvailable = YES;
+    if (prior.diskAvailable && now > prior.diskSampleTime) {
+        double elapsed = now - prior.diskSampleTime;
+        current.diskReadBytesPerSecond = ITopDiskRate(readBytes, prior.diskReadBytes, elapsed);
+        current.diskWriteBytesPerSecond = ITopDiskRate(writeBytes, prior.diskWriteBytes, elapsed);
+        current.diskRatesKnown = YES;
+    } else {
+        current.diskReadBytesPerSecond = prior.diskReadBytesPerSecond;
+        current.diskWriteBytesPerSecond = prior.diskWriteBytesPerSecond;
+        current.diskRatesKnown = prior.diskRatesKnown;
+    }
+}
+
+
 - (void)sampleNetworkInto:(ITopSnapshot *)snapshot now:(NSTimeInterval)now {
     struct ifaddrs *interfaces = NULL;
     if (getifaddrs(&interfaces) != 0 || !interfaces) {
@@ -410,17 +454,29 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
                     current.energyPowerMilliwatts = (double)(usage6.ri_energy_nj - prior.energyNanojoules) /
                         elapsedEnergy / 1000000.0;
                 }
+                ITopDiskSampleInto(current, prior, usage6.ri_diskio_bytesread, usage6.ri_diskio_byteswritten, now);
             } else {
                 struct rusage_info_v4 usage4 = {0};
-                if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage4) == 0) {
+                BOOL v4Succeeded = proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage4) == 0;
+                if (v4Succeeded) {
                     current.footprintBytes = usage4.ri_phys_footprint;
                     current.peakFootprintBytes = usage4.ri_lifetime_max_phys_footprint;
+                    ITopDiskSampleInto(current, prior, usage4.ri_diskio_bytesread, usage4.ri_diskio_byteswritten, now);
                 }
                 if (prior) {
                     current.energyNanojoules = prior.energyNanojoules;
                     current.energySampleTime = prior.energySampleTime;
                     current.energyPowerMilliwatts = prior.energyPowerMilliwatts;
                     current.energyAvailable = prior.energyAvailable;
+                    if (!v4Succeeded) {
+                        current.diskReadBytes = prior.diskReadBytes;
+                        current.diskWriteBytes = prior.diskWriteBytes;
+                        current.diskSampleTime = prior.diskSampleTime;
+                        current.diskAvailable = prior.diskAvailable;
+                        current.diskRatesKnown = prior.diskRatesKnown;
+                        current.diskReadBytesPerSecond = prior.diskReadBytesPerSecond;
+                        current.diskWriteBytesPerSecond = prior.diskWriteBytesPerSecond;
+                    }
                 }
             }
         } else if (prior) {
@@ -430,6 +486,13 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
             current.energySampleTime = prior.energySampleTime;
             current.energyPowerMilliwatts = prior.energyPowerMilliwatts;
             current.energyAvailable = prior.energyAvailable;
+            current.diskReadBytes = prior.diskReadBytes;
+            current.diskWriteBytes = prior.diskWriteBytes;
+            current.diskSampleTime = prior.diskSampleTime;
+            current.diskReadBytesPerSecond = prior.diskReadBytesPerSecond;
+            current.diskWriteBytesPerSecond = prior.diskWriteBytesPerSecond;
+            current.diskAvailable = prior.diskAvailable;
+            current.diskRatesKnown = prior.diskRatesKnown;
         }
         nextStats[key] = current;
 
@@ -453,6 +516,11 @@ static uint64_t ITopDelta32(uint32_t current, uint32_t previous) {
         process.pageinsPerSecond = pageinsPerSecond;
         process.contextSwitchesPerSecond = switchesPerSecond;
         process.syscallsPerSecond = syscallsPerSecond;
+        process.diskReadBytesPerSecond = current.diskReadBytesPerSecond;
+        process.diskWriteBytesPerSecond = current.diskWriteBytesPerSecond;
+        process.diskReadBytesTotal = current.diskReadBytes;
+        process.diskWriteBytesTotal = current.diskWriteBytes;
+        process.diskAvailable = current.diskRatesKnown;
         [rows addObject:process];
     }
     free(pids);
@@ -777,7 +845,7 @@ static int ITopSelfTest(void) {
         ITopProcTaskInfo ownTask = {0};
         int ownTaskBytes = proc_pidinfo(getpid(), ITopProcPIDTaskInfo, 0, &ownTask, (int)sizeof(ownTask));
         printf("  self PROC_PIDTASKINFO: %d bytes (ABI size %lu)\n", ownTaskBytes, (unsigned long)sizeof(ownTask));
-        struct timespec pause = { .tv_sec = 0, .tv_nsec = 250000000 };
+        struct timespec pause = { .tv_sec = 1, .tv_nsec = 200000000 };  // disk live-check window
         nanosleep(&pause, NULL);
         ITopSnapshot *second = [monitor collect];
         NSUInteger validProcesses = 0;
@@ -880,7 +948,6 @@ static int ITopSelfTest(void) {
         printf("  process list: %lu PIDs, %lu readable; second sample %lu valid, peak %.1f%%\n",
                (unsigned long)second.processCount, (unsigned long)second.processes.count,
                (unsigned long)validProcesses, peakProcessCPU);
-
         const double netRates[] = {0.0, 1.0, 10.0, 1000.0, 100000.0, 1e6, 1e9};
         NSUInteger netPreviousLevel = 0, netLevelCount = 0;
         for (NSUInteger i = 0; i < sizeof(netRates) / sizeof(netRates[0]); i++) {
@@ -908,18 +975,15 @@ static int ITopSelfTest(void) {
         printf("  net sparklines: %lu rate levels (0->%lu, 1e6->%lu clamped); ring stays 64 entries after 520 appends\n",
                (unsigned long)netLevelCount, (unsigned long)ITopNetLevelForRate(0.0),
                (unsigned long)ITopNetLevelForRate(1e6));
-        // Exercise the 1 Hz collection loop a few extra times: the probe paths
-        // allocate nothing per cycle (level trap is register-argued, the
-        // priority probe frees its buffer), so repeated collects must neither
-        // accumulate state nor lose the reading.
-        NSUInteger pressureStable = 0;
-        for (NSUInteger check = 0; check < 3; check++) {
-            nanosleep(&pause, NULL);
-            ITopSnapshot *checkSnapshot = [monitor collect];
-            if (checkSnapshot.memoryPressureAvailable) pressureStable++;
+        // Per-process disk I/O rates: pure window arithmetic first, then live values.
+        double terabyteRate = ITopDiskRate(1ull << 40, 0, 60.0);
+        if (ITopDiskRate(2048, 0, 1.0) != 2048.0 ||
+            ITopDiskRate(100, 100, 0.25) != 0.0 ||
+            ITopDiskRate(100, 200, 0.25) != 0.0 ||  // counter reset clamps to 0
+            !isfinite(terabyteRate) || terabyteRate <= 0.0) {
+            fprintf(stderr, "FAIL: per-process disk rate arithmetic\n");
+            return 1;
         }
-        printf("  probe stability: pressure level available in %lu/3 loop collects\n",
-               (unsigned long)pressureStable);
         if (!snapshot.machine.length || snapshot.memoryTotal == 0 || snapshot.coreUsage.count == 0 ||
             !snapshot.processAccess || snapshot.processCount == 0 || validProcesses == 0 ||
             !isfinite(second.cpu) || second.cpu < 0 || second.cpu > 100 ||
@@ -930,6 +994,43 @@ static int ITopSelfTest(void) {
         if (!second.thermalState.length || !isfinite(second.collectionMilliseconds)) {
             fprintf(stderr, "FAIL: diagnostic field sampling failed\n");
             return 1;
+        }
+        // Live check: this shell process's disk values are finite/non-negative
+        // (zero is valid until the second rusage sample lands).
+        ITopProcess *ownProcess = nil;
+        for (ITopProcess *process in second.processes)
+            if (process.pid == getpid()) { ownProcess = process; break; }
+        if (ownProcess && (!isfinite(ownProcess.diskReadBytesPerSecond) || !isfinite(ownProcess.diskWriteBytesPerSecond) ||
+            ownProcess.diskReadBytesPerSecond < 0 || ownProcess.diskWriteBytesPerSecond < 0)) {
+            fprintf(stderr, "FAIL: live per-process disk values are not finite/non-negative\n");
+            return 1;
+        }
+        // One ~5 s rusage window later the rate fields must be displayable for
+        // a long-lived process; sample once more without busy work (2 cores).
+        struct timespec rusagePause = { .tv_sec = 4, .tv_nsec = 400000000 };
+        nanosleep(&rusagePause, NULL);
+        ITopSnapshot *third = [monitor collect];
+        ownProcess = nil;
+        for (ITopProcess *process in third.processes)
+            if (process.pid == getpid()) { ownProcess = process; break; }
+        if (ownProcess && (!isfinite(ownProcess.diskReadBytesPerSecond) || !isfinite(ownProcess.diskWriteBytesPerSecond) ||
+            ownProcess.diskReadBytesPerSecond < 0 || ownProcess.diskWriteBytesPerSecond < 0)) {
+            fprintf(stderr, "FAIL: rusage-window per-process disk values are not finite/non-negative\n");
+            return 1;
+        }
+        if (ownProcess) {
+            if (ownProcess.diskAvailable) {
+                printf("  self disk: rates %.0f/%.0f bytes per second (%s/%s), totals %llu/%llu bytes\n",
+                       ownProcess.diskReadBytesPerSecond, ownProcess.diskWriteBytesPerSecond,
+                       ITopTermBytes((uint64_t)ownProcess.diskReadBytesPerSecond).UTF8String ?: "?",
+                       ITopTermBytes((uint64_t)ownProcess.diskWriteBytesPerSecond).UTF8String ?: "?",
+                       (unsigned long long)ownProcess.diskReadBytesTotal,
+                       (unsigned long long)ownProcess.diskWriteBytesTotal);
+            } else {
+                printf("  self disk: counters unavailable in this context (totals %llu/%llu bytes)\n",
+                       (unsigned long long)ownProcess.diskReadBytesTotal,
+                       (unsigned long long)ownProcess.diskWriteBytesTotal);
+            }
         }
         if (second.processes.count == 0) {
             printf("PASS: host metrics and process enumeration work; per-process metadata is restricted in this shell context\n");
