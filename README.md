@@ -7,6 +7,9 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
 - Overall and per-core CPU load with a short history graph.
 - Physical memory, wired/compressed memory, root filesystem usage, uptime, and battery.
 - Read-only process list with CPU and resident memory, sorting, name/PID filtering, row selection, and scrolling.
+- Persisted view settings: the active sort key and direction and the filter text are saved to `NSUserDefaults`
+  (`itop.sort.key`, `itop.sort.desc`, `itop.filter`) and validated on load, so a relaunch keeps the user's view.
+  Paused state is deliberately transient and is not persisted.
 - Diagnostics panel: itop energy use, thermal state, Wi-Fi/cellular RX/TX rates,
   collection time, and jetsam headroom for this process (shown as n/a when the
   runtime does not provide a value). Selecting a row adds per-process energy

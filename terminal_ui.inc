@@ -219,6 +219,40 @@ static pid_t ITopJumpTargetPID(NSString *draft) {
     return (pid_t)value;
 }
 
+// ---------------------------------------------------------------------------
+// Persisted settings (NSUserDefaults).
+// sort key + direction + filter text survive relaunch so a jailbreak screen
+// reader or accidental respring keeps the user's view; paused state is
+// deliberately transient. Values are validated on read: anything that is not
+// a known sort key degrades to the CPU% default.
+// ---------------------------------------------------------------------------
+
+static NSString * const ITopDefaultsSortKey = @"itop.sort.key";
+static NSString * const ITopDefaultsSortDesc = @"itop.sort.desc";
+static NSString * const ITopDefaultsFilter = @"itop.filter";
+
+static NSSet<NSString *> *ITopSortKeySet(void) {
+    static NSSet<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = [NSSet setWithArray:@[
+            @"CPU%", @"RES", @"MEM%", @"VIRT", @"TIME+", @"PID", @"USER", @"PRI", @"NI", @"Command"
+        ]];
+    });
+    return keys;
+}
+
+static BOOL ITopSortKeyValid(NSString *key) {
+    return key.length > 0 && [ITopSortKeySet() containsObject:key];
+}
+
+// Canonical default direction for a sort key (mirrors header-tap and S-cycle).
+static BOOL ITopSortDescendingFor(NSString *key) {
+    return [key isEqualToString:@"CPU%"] || [key isEqualToString:@"RES"] ||
+           [key isEqualToString:@"VIRT"] || [key isEqualToString:@"MEM%"] ||
+           [key isEqualToString:@"TIME+"];
+}
+
 @interface ITopCanvas : UIView <UIKeyInput>
 @property (nonatomic, weak) id<ITopCanvasDelegate> delegate;
 @property (nonatomic, strong) ITopSnapshot *snapshot;
@@ -229,6 +263,7 @@ static pid_t ITopJumpTargetPID(NSString *draft) {
 @property (nonatomic, copy) NSString *filterText;
 @property (nonatomic, copy) NSString *sortKey;
 @property (nonatomic) BOOL sortDescending;
+@property (nonatomic, strong) NSUserDefaults *settingStore;
 @property (nonatomic) pid_t selectedPID;
 @property (nonatomic) NSUInteger scrollOffset;
 @property (nonatomic) CGFloat keyboardHeight;
@@ -253,6 +288,7 @@ static pid_t ITopJumpTargetPID(NSString *draft) {
 - (void)cancelJump;
 - (BOOL)isSearching;
 - (BOOL)isJumping;
+- (void)loadStoredSettingsFromDefaults:(NSUserDefaults *)store;
 @end
 
 @implementation ITopCanvas {
@@ -292,9 +328,6 @@ static pid_t ITopJumpTargetPID(NSString *draft) {
         self.backgroundColor = ITopTheme().background;
         self.contentScaleFactor = UIScreen.mainScreen.scale;
         self.multipleTouchEnabled = NO;
-        _filterText = @"";
-        _sortKey = @"CPU%";
-        _sortDescending = YES;
         _helpCol = NSNotFound;
         _refreshCol = NSNotFound;
         _fpsCol = NSNotFound;
@@ -303,8 +336,48 @@ static pid_t ITopJumpTargetPID(NSString *draft) {
         _cpuHistory = [NSMutableArray arrayWithCapacity:64];
         for (NSUInteger i = 0; i < 64; i++) [_cpuHistory addObject:@0];
         _batteryLevel = -1;
+        [self loadStoredSettingsFromDefaults:nil];   // nil -> the standard suite
     }
     return self;
+}
+
+- (NSUserDefaults *)settingStore {
+    // Production uses the standard suite; the --self-test injects a throwaway
+    // suite so validation writes never touch real user settings.
+    return _settingStore ?: NSUserDefaults.standardUserDefaults;
+}
+
+// Reads persisted settings into the canvas. Assigns ivars directly so loading
+// never writes back; persisted defaults only change when the user changes state.
+- (void)loadStoredSettingsFromDefaults:(NSUserDefaults *)store {
+    NSUserDefaults *source = store ?: NSUserDefaults.standardUserDefaults;
+    NSString *storedKey = [source stringForKey:ITopDefaultsSortKey];
+    _sortKey = ITopSortKeyValid(storedKey) ? storedKey : @"CPU%";   // garbage degrades to the default view
+    _sortDescending = ITopSortDescendingFor(_sortKey);
+    id storedDirection = [source objectForKey:ITopDefaultsSortDesc];
+    if ([storedDirection respondsToSelector:@selector(boolValue)]) _sortDescending = [storedDirection boolValue];
+    NSString *storedFilter = [source stringForKey:ITopDefaultsFilter];
+    _filterText = storedFilter ?: @"";
+}
+
+- (void)setFilterText:(NSString *)filterText {
+    NSString *value = [filterText copy] ?: @"";
+    if ([value isEqualToString:_filterText]) return;
+    _filterText = value;
+    [[self settingStore] setObject:value forKey:ITopDefaultsFilter];
+}
+
+- (void)setSortKey:(NSString *)sortKey {
+    NSString *value = [sortKey copy] ?: @"";
+    if ([value isEqualToString:_sortKey]) return;
+    _sortKey = value;
+    [[self settingStore] setObject:value forKey:ITopDefaultsSortKey];
+}
+
+- (void)setSortDescending:(BOOL)sortDescending {
+    if (sortDescending == _sortDescending) return;
+    _sortDescending = sortDescending;
+    [[self settingStore] setBool:sortDescending forKey:ITopDefaultsSortDesc];
 }
 
 - (BOOL)isSearching { return _searching; }
