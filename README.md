@@ -10,7 +10,10 @@ A native, rootless-jailbreak iOS/iPadOS system monitor rendered as a full-screen
 - Diagnostics panel: itop energy use, thermal state, Wi-Fi/cellular RX/TX rates,
   collection time, and jetsam headroom for this process (shown as n/a when the
   runtime does not provide a value). Selecting a row adds per-process energy
-  plus fault, page-in, context-switch, and syscall rates in the status line.
+  plus fault, page-in, context-switch, and syscall rates in the status line,
+  and shows per-process disk read/write rates for the selected row (cumulative
+  totals on wide layouts; narrow layouts drop the least important rate fields
+  rather than cutting numbers).
 - Terminal key bar, touch row selection, swipe scrolling, and hardware keyboard shortcuts.
 - Process information entitlements are limited to enumeration/inspection; itop does not kill or modify processes.
 - iPhone and iPad layouts; deployment target iOS 15; arm64 package.

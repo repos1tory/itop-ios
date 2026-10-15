@@ -97,6 +97,36 @@ static NSString *ITopTermBytes(uint64_t value) {
     return [NSString stringWithFormat:@"%lluB", (unsigned long long)value];
 }
 
+// Joins status-line fields with the usual two-space separator, dropping the
+// least important fields until the line fits `columns` so ITopTermPut never
+// cuts one mid-number. Parts are {text, dropWeight} pairs: a higher weight
+// drops first, among equal weights the earlier field drops first, and the
+// first four fields (PID, command, threads, CPU) are always kept; a still-
+// too-wide tail is then clipped by ITopTermPut at draw time.
+static NSString *ITopTermJoinStatus(NSArray<NSArray<id> *> *parts, NSUInteger columns) {
+    NSUInteger count = parts.count;
+    NSMutableArray<NSArray<id> *> *kept = [parts mutableCopy];
+    while (count > 4) {
+        NSUInteger total = count ? [kept[0][0] length] : 0;
+        for (NSUInteger i = 1; i < count; i++) total += 2 + [kept[i][0] length];
+        if (total <= columns) break;
+        NSInteger best = -1;
+        NSUInteger drop = count - 1;
+        for (NSUInteger i = 4; i < count; i++) {
+            NSInteger weight = [kept[i][1] integerValue];
+            if (weight >= best) { best = weight; drop = i; }
+        }
+        [kept removeObjectAtIndex:drop];
+        count--;
+    }
+    NSMutableString *joined = [NSMutableString string];
+    for (NSUInteger i = 0; i < count; i++) {
+        if (i) [joined appendString:@"  "];
+        [joined appendString:kept[i][0]];
+    }
+    return joined;
+}
+
 static NSString *ITopTermDuration(NSTimeInterval seconds) {
     NSUInteger total = (NSUInteger)MAX(0, seconds);
     NSUInteger days = total / 86400;
@@ -397,7 +427,10 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
             @"  CPU, memory, battery and root filesystem stats refresh every second.",
             @"  Diagnostics: itop energy use, thermal state, network RX/TX rates,",
             @"  collection time, and this process's jetsam headroom (n/a if hidden by iOS).",
-            @"  Selecting a row adds per-process energy plus fault/pagein/switch/syscall rates.",
+            @"  Selecting a row adds per-process energy, fault/pagein/switch/syscall",
+            @"  rates, and DISK read/write rate per second for the selected row.",
+            @"  Wide layout also totals lifetime disk read/written (TOT); narrow",
+            @"  layouts drop least-important rate fields instead of cutting numbers.",
             @"  Zone map: header '?', header 'R', FPS readout, Tasks-bar search tag, column titles.",
             @"  ?  (header)        Open or close this help page",
             @"  R  (header)        Re-sample right now",
@@ -702,10 +735,30 @@ static void ITopTermBoxSides(NSMutableAttributedString *line, NSUInteger column,
         if (selectedProcess) {
             NSString *processEnergy = selectedProcess.energyAvailable ?
                 [NSString stringWithFormat:@"%.1fmW", selectedProcess.energyPowerMilliwatts] : @"n/a";
-            status = [NSString stringWithFormat:@"PID %d  %@  THR %d/%d  CPU %.1f%%  ENER %@  FLT %.0f/s  PGI %.0f/s  CTX %.0f/s  SYS %.0f/s",
-                selectedProcess.pid, selectedProcess.name, selectedProcess.runningThreads, selectedProcess.threads,
-                selectedProcess.cpu, processEnergy, selectedProcess.faultsPerSecond, selectedProcess.pageinsPerSecond,
-                selectedProcess.contextSwitchesPerSecond, selectedProcess.syscallsPerSecond];
+            NSString *diskRates = selectedProcess.diskAvailable ?
+                [NSString stringWithFormat:@"%@/%@",
+                    ITopTermBytes((uint64_t)selectedProcess.diskReadBytesPerSecond),
+                    ITopTermBytes((uint64_t)selectedProcess.diskWriteBytesPerSecond)] : @"--";
+            NSMutableArray<NSArray<id> *> *statusFields = [NSMutableArray array];
+            [statusFields addObjectsFromArray:@[
+                @[[NSString stringWithFormat:@"PID %d", selectedProcess.pid], @0],
+                @[selectedProcess.name ?: @"?", @0],
+                @[[NSString stringWithFormat:@"THR %d/%d", selectedProcess.runningThreads, selectedProcess.threads], @0],
+                @[[NSString stringWithFormat:@"CPU %.1f%%", selectedProcess.cpu], @0],
+                @[[NSString stringWithFormat:@"ENER %@", processEnergy], @4],
+                @[[NSString stringWithFormat:@"FLT %.0f/s", selectedProcess.faultsPerSecond], @5],
+                @[[NSString stringWithFormat:@"PGI %.0f/s", selectedProcess.pageinsPerSecond], @5],
+                @[[NSString stringWithFormat:@"CTX %.0f/s", selectedProcess.contextSwitchesPerSecond], @6],
+                @[[NSString stringWithFormat:@"SYS %.0f/s", selectedProcess.syscallsPerSecond], @6],
+                @[[NSString stringWithFormat:@"DISK %@", diskRates], @2]
+            ]];
+            if (!narrow && selectedProcess.diskAvailable) {
+                [statusFields addObject:@[
+                    [NSString stringWithFormat:@"TOT %@/%@",
+                        ITopTermBytes(selectedProcess.diskReadBytesTotal),
+                        ITopTermBytes(selectedProcess.diskWriteBytesTotal)], @3]];
+            }
+            status = ITopTermJoinStatus(statusFields, columns);
         } else {
             status = [NSString stringWithFormat:@"Showing %lu-%lu of %lu",
                 (unsigned long)(visible.count ? self.scrollOffset + 1 : 0), (unsigned long)end, (unsigned long)visible.count];
