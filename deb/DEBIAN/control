@@ -1,0 +1,8 @@
+Package: com.itop.monitor
+Name: itop
+Version: 1.1.0
+Architecture: iphoneos-arm64
+Description: Lightweight high-refresh native iOS system monitor
+Maintainer: itop
+Section: Utilities
+Priority: optional
