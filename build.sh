@@ -10,15 +10,14 @@ umask 022
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SDK="${SDK:-/var/jb/usr/share/SDKs/iPhoneOS.sdk}"
-CLANG="${CLANG:-/var/jb/usr/bin/clang}"
-LDID="${LDID:-/var/jb/usr/bin/ldid}"
-DPKG="${DPKG:-/var/jb/usr/bin/dpkg-deb}"
+pick() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return; }; done; }
+CLANG="${CLANG:-$(pick /var/jb/usr/bin/clang clang)}"
+LDID="${LDID:-$(pick /var/jb/usr/bin/ldid ldid)}"
+DPKG="${DPKG:-$(pick /var/jb/usr/bin/dpkg-deb dpkg-deb)}"
 for tool in "$CLANG" "$LDID" "$DPKG"; do
-    command -v "$tool" >/dev/null 2>&1 || {
-        echo "missing tool: $tool (set CLANG/LDID/DPKG, or pass SDK for the headers)" >&2
-        exit 1
-    }
+    [ -n "$tool" ] || { echo "missing tool (set CLANG/LDID/DPKG)" >&2; exit 1; }
 done
+[ -d "$SDK" ] || { echo "SDK not found: $SDK (set SDK)" >&2; exit 1; }
 ACTION="${1:-build}"
 
 VERSION="$(sed -n '/^Version:/{s/^Version:[[:space:]]*//;p;q;}' "$ROOT/packaging/control")"
