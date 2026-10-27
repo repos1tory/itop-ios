@@ -37,8 +37,9 @@ build_itop() {
         -lproc -Wl,-dead_strip \
         -o "$APP/itop" "$ROOT/main.m"
     cp "$ROOT/Info.plist" "$APP/Info.plist"
-    "$CLANG" -arch arm64 -mios-version-min=15.0 -isysroot "$SDK" \
-        -O2 -o "$ROOT/build/make_icon" "$ROOT/tools/make_icon.c" -lz
+    # Host tool: no -arch/-isysroot, it has to run on the build machine
+    # (the device when building on-device, macOS in CI).
+    "$CLANG" -O2 -o "$ROOT/build/make_icon" "$ROOT/tools/make_icon.c" -lz
     "$ROOT/build/make_icon" "$APP"
     chmod 755 "$APP" "$APP/itop"
     chmod 644 "$APP/Info.plist"
